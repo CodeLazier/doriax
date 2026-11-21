@@ -1584,9 +1584,13 @@ std::string editor::Factory::createScriptComponent(int indentSpaces, EntityRegis
         std::string idx = std::to_string(i);
         code << ind << "script.scripts.push_back(ScriptEntry());\n";
         code << ind << "script.scripts[" << idx << "].type = " << formatScriptType(script.scripts[i].type) << ";\n";
-        // a logic graph ships as its script
+        // a logic graph or Teal file ships as the Lua written from it
         std::string scriptPath = script.scripts[i].path;
+#ifdef DORIAX_TEAL
+        if (Util::isLogicGraphFile(scriptPath) || Util::isTealFile(scriptPath))
+#else
         if (Util::isLogicGraphFile(scriptPath))
+#endif
             scriptPath = scriptPath.substr(0, scriptPath.rfind('.')) + ".lua";
         code << ind << "script.scripts[" << idx << "].path = " << formatString(scriptPath) << ";\n";
         code << ind << "script.scripts[" << idx << "].headerPath = " << formatString(script.scripts[i].headerPath) << ";\n";

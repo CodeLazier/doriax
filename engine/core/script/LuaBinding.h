@@ -27,6 +27,9 @@ namespace doriax {
         
         static void createLuaState();
         static int setLuaPath(const char* path);
+        // Compiled Lua for Teal modules, used by moduleLoader after the Lua
+        // directory misses. Empty (the default) disables the fallback.
+        static void setTealModulePath(const std::string& path);
         static int setLuaSearcher(lua_CFunction f, bool cleanSearchers = false);
         static void configureProjectLuaLoader();
 

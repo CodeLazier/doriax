@@ -8,6 +8,7 @@
 
 #include "util/Util.h"
 #include "util/UIUtils.h"
+#include "util/FileUtils.h"
 #include "util/FileDialogs.h"
 #include "util/TextEncoding.h"
 #include "util/EntityPayload.h"
@@ -8898,6 +8899,11 @@ void editor::Properties::drawScriptComponent(ComponentType cpType, SceneProject*
     if (ImGui::BeginPopup("script_add_menu")) {
         bool addLua = ImGui::MenuItem("Lua Script");
         bool addCpp = ImGui::MenuItem("C++ Script");
+#ifdef DORIAX_TEAL
+        const bool addTeal = ImGui::MenuItem("Teal Script");
+#else
+        const bool addTeal = false;
+#endif
         // a graph is picked at once: it runs as the Lua script written from it
         std::filesystem::path graph;
         if (ImGui::MenuItem("Logic Graph")) {
@@ -8931,6 +8937,53 @@ void editor::Properties::drawScriptComponent(ComponentType cpType, SceneProject*
             multiCmd->setNoMerge();
             CommandHandle::get(project->getSelectedSceneId())->addCommand(multiCmd);
         }
+        // Teal entity scripts use the same Lua script slot as Lua scripts.
+        if (addTeal) {
+            Entity firstEntity = entities.empty() ? NULL_ENTITY : entities[0];
+            std::string defaultName = "NewScript";
+            if (firstEntity != NULL_ENTITY) {
+                const std::string entityName = sceneProject->scene->getEntityName(firstEntity);
+                if (!entityName.empty())
+                    defaultName = entityName + "Script";
+            }
+            scriptCreateDialog.open(
+                sceneProject->scene,
+                firstEntity,
+                project->getProjectPath(),
+                project->getLuaPath(),
+                defaultName,
+                [this, sceneProject, entities](const std::filesystem::path& headerPath,
+                                               const std::filesystem::path& sourcePath,
+                                               const std::string& name,
+                                               ScriptType type) {
+                    editor::MultiPropertyCmd* multiCmd = new editor::MultiPropertyCmd();
+                    for (const Entity& entity : entities) {
+                        ScriptComponent& scriptComp = sceneProject->scene->getComponent<ScriptComponent>(entity);
+                        std::vector<ScriptEntry> newScripts = scriptComp.scripts;
+                        ScriptEntry entry;
+                        entry.type = type;
+                        entry.enabled = true;
+                        entry.className = name;
+                        if (type == ScriptType::CPP) {
+                            entry.headerPath = headerPath.generic_string();
+                            entry.path = sourcePath.generic_string();
+                        } else {
+                            entry.path = sourcePath.generic_string();
+                        }
+                        newScripts.push_back(entry);
+                        project->updateScriptProperties(sceneProject, entity, newScripts);
+                        multiCmd->addCommand(std::make_unique<editor::PropertyCmd<std::vector<ScriptEntry>>>(
+                            project, sceneProject->id, entity, ComponentType::ScriptComponent, "scripts", newScripts));
+                    }
+                    multiCmd->setNoMerge();
+                    CommandHandle::get(project->getSelectedSceneId())->addCommand(multiCmd);
+                    if (Util::isLogicGraphFile(sourcePath.string()))
+                        Backend::getApp().getGraphEditorWindow()->openFile(project->resolveLuaPath(sourcePath));
+                },
+                []() {},
+                ScriptCreateDialog::InitialTemplate::Teal);
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::EndPopup();
     }
     endTable();
@@ -8956,7 +9009,14 @@ void editor::Properties::drawScriptComponent(ComponentType cpType, SceneProject*
         if (script.type == ScriptType::CPP) {
             typeLabel = " [C++]";
         } else if (script.type == ScriptType::LUA) {
-            typeLabel = Util::isLogicGraphFile(script.path) ? " [Logic]" : " [Lua]";
+            if (Util::isLogicGraphFile(script.path))
+                typeLabel = " [Logic]";
+#ifdef DORIAX_TEAL
+            else if (Util::isTealFile(script.path))
+                typeLabel = " [Teal]";
+#endif
+            else
+                typeLabel = " [Lua]";
         }
 
         const float indentation = 10.0f;
@@ -9235,12 +9295,21 @@ void editor::Properties::drawScriptComponent(ComponentType cpType, SceneProject*
                         startDirectory.string(), FILE_DIALOG_SCRIPT);
                     if (!selected.empty()) {
                         std::filesystem::path p(selected);
+                        // A Lua slot also accepts a Teal script or a logic graph. Both run as generated Lua.
                         const bool validType = script.type == ScriptType::LUA
-                            ? (Util::isLuaFile(p.string()) || Util::isLogicGraphFile(p.string()))
+#ifdef DORIAX_TEAL
+                            ? (Util::isLuaFile(FileUtils::pathToGenericUtf8(p)) || Util::isTealFile(FileUtils::pathToGenericUtf8(p)) || Util::isLogicGraphFile(FileUtils::pathToGenericUtf8(p)))
+#else
+                            ? (Util::isLuaFile(FileUtils::pathToGenericUtf8(p)) || Util::isLogicGraphFile(FileUtils::pathToGenericUtf8(p)))
+#endif
                             : Util::isSourceFile(p.string());
                         if (!validType) {
                             Backend::getApp().registerAlert("Error", script.type == ScriptType::LUA
-                                ? "Select a Lua script file or a logic graph."
+#ifdef DORIAX_TEAL
+                                ? "Select a Lua script, a Teal script, or a logic graph."
+#else
+                                ? "Select a Lua script or a logic graph."
+#endif
                                 : "Select a C++ source file.");
                         } else {
                             // Lua sources are stored relative to the Lua root ("lua://")

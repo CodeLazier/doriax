@@ -500,6 +500,8 @@ namespace doriax::editor{
 
         std::vector<std::filesystem::path> collectLogicGraphs() const;
         std::vector<std::string> collectLogicLuaScripts() const;
+        // .lua names a generated project resolves for Teal scripts. Not the .tl paths stored in the scene.
+        std::vector<std::string> collectTealLuaScripts() const;
         std::vector<SceneScriptSource> collectLogicCppScripts() const;
         std::vector<BundleSceneInfo> collectAllBundles() const;
 
@@ -823,7 +825,7 @@ namespace doriax::editor{
         void remapMaterialFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
         void remapSceneFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
         void remapEntityBundleFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
-        void remapScriptFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
+        void remapScriptFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath, bool isDirectory = false);
         void remapAssetFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
         void remapShaderFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath);
         // moves the open tabs of a file or folder
@@ -831,7 +833,7 @@ namespace doriax::editor{
         void cleanupMaterialFilePath(const std::filesystem::path& deletedPath);
         void cleanupSceneFilePath(const std::filesystem::path& deletedPath);
         void cleanupEntityBundleFilePath(const std::filesystem::path& deletedPath);
-        void cleanupScriptFilePath(const std::filesystem::path& deletedPath);
+        void cleanupScriptFilePath(const std::filesystem::path& deletedPath, bool isDirectory = false);
         void cleanupAssetFilePath(const std::filesystem::path& deletedPath);
         void cleanupShaderFilePath(const std::filesystem::path& deletedPath);
 

@@ -58,14 +58,15 @@ void ScriptCreateDialog::open(Scene* scene,
                               const fs::path& luaPath,
                               const std::string& defaultBaseName,
                               std::function<void(const fs::path&, const fs::path&, const std::string&, ScriptType)> onCreate,
-                              std::function<void()> onCancel) {
+                              std::function<void()> onCancel,
+                              InitialTemplate initial) {
     m_isOpen = true;
     m_scene = scene;
     m_entity = entity;
     m_projectPath = projectPath;
     m_luaPath = luaPath;
-    m_selectedPath = projectPath.string();
-    m_creationKind = CreationKind::CPP_SUBCLASS;
+    m_creationKind = initial == InitialTemplate::Teal ? CreationKind::TEAL : CreationKind::CPP_SUBCLASS;
+    m_selectedPath = (m_creationKind == CreationKind::TEAL ? luaPath : projectPath).string();
     m_existingScriptType = ScriptType::CPP;
     m_attachExisting = false;
     m_existingHeaderPath.clear();
@@ -107,6 +108,11 @@ fs::path ScriptCreateDialog::makeSourcePath(const std::string& className) const 
 
 fs::path ScriptCreateDialog::makeLuaPath(const std::string& moduleName) const {
     return fs::path(m_selectedPath) / (moduleName + ".lua");
+}
+
+bool ScriptCreateDialog::isLuaFamily(CreationKind kind) {
+    // Lua, Teal and logic graphs share the Lua directory and a Lua script slot.
+    return kind == CreationKind::LUA || kind == CreationKind::TEAL || kind == CreationKind::LOGIC;
 }
 
 void ScriptCreateDialog::writeFiles(const fs::path& headerPath,
@@ -273,13 +279,20 @@ void ScriptCreateDialog::writeFiles(const fs::path& headerPath,
             f << "return " << classOrModuleName << "\n";
         }
     }
+
+    if (kind == CreationKind::TEAL) {
+        // Teal is written as .tl; the engine compiles it when the script runs.
+        fs::create_directories(sourcePath.parent_path());
+        std::ofstream f(sourcePath, std::ios::binary | std::ios::trunc);
+        if (f) f << ProjectUtils::getTealScriptTemplate(classOrModuleName);
+    }
 }
 
 void ScriptCreateDialog::finalizeCreation(const fs::path& headerPath,
                                           const fs::path& sourcePath,
                                           const std::string& name) {
-    // a logic graph is attached as the Lua script written from it
-    const bool isLua = m_creationKind == CreationKind::LUA || m_creationKind == CreationKind::LOGIC;
+    // a logic graph or Teal file is attached as the Lua script written from it
+    const bool isLua = isLuaFamily(m_creationKind);
     const ScriptType type = isLua ? ScriptType::LUA : ScriptType::CPP;
 
     writeFiles(headerPath, sourcePath, name, m_creationKind);
@@ -338,7 +351,11 @@ void ScriptCreateDialog::selectExistingFile(bool selectHeader) {
     if (selected.empty()) return;
 
     const fs::path selectedPath = fs::path(selected).lexically_normal();
-    if (Util::isLuaFile(selectedPath.string()) || Util::isLogicGraphFile(selectedPath.string())) {
+    if (Util::isLuaFile(FileUtils::pathToGenericUtf8(selectedPath))
+#ifdef DORIAX_TEAL
+        || Util::isTealFile(FileUtils::pathToGenericUtf8(selectedPath))
+#endif
+        || Util::isLogicGraphFile(FileUtils::pathToGenericUtf8(selectedPath))) {
         if (selectHeader) {
             m_attachError = "Select a C++ header (.h, .hh, .hpp, or .hxx).";
             return;
@@ -425,12 +442,15 @@ void ScriptCreateDialog::show() {
         if (ImGui::RadioButton("C++ Subclass", (int*)&m_creationKind, (int)CreationKind::CPP_SUBCLASS)) {}
         if (ImGui::RadioButton("C++ Script Class", (int*)&m_creationKind, (int)CreationKind::CPP_SCRIPT_CLASS)) {}
         if (ImGui::RadioButton("Lua Script", (int*)&m_creationKind, (int)CreationKind::LUA)) {}
+#ifdef DORIAX_TEAL
+        if (ImGui::RadioButton("Teal Script", (int*)&m_creationKind, (int)CreationKind::TEAL)) {}
+#endif
         if (ImGui::RadioButton("Logic Graph", (int*)&m_creationKind, (int)CreationKind::LOGIC)) {}
     }
 
     bool isLua = m_attachExisting
         ? m_existingScriptType == ScriptType::LUA
-        : (m_creationKind == CreationKind::LUA || m_creationKind == CreationKind::LOGIC);
+        : isLuaFamily(m_creationKind);
     bool isCpp = !isLua;
 
     ImGui::Spacing();
@@ -492,7 +512,12 @@ void ScriptCreateDialog::show() {
 
         if (!m_existingSourcePath.empty() || !m_existingHeaderPath.empty()) {
             const char* detectedType = m_existingScriptType != ScriptType::LUA ? "C++ Script"
-                : (Util::isLogicGraphFile(m_existingSourcePath.string()) ? "Logic Graph" : "Lua Script");
+                : (Util::isLogicGraphFile(m_existingSourcePath.string()) ? "Logic Graph"
+#ifdef DORIAX_TEAL
+                : (Util::isTealFile(FileUtils::pathToGenericUtf8(m_existingSourcePath)) ? "Teal Script" : "Lua Script"));
+#else
+                : "Lua Script");
+#endif
             ImGui::TextDisabled("Detected type: %s", detectedType);
         }
     } else {
@@ -561,8 +586,8 @@ void ScriptCreateDialog::show() {
     std::string baseName = m_baseNameBuffer;
     bool hasBase = !baseName.empty();
     std::string name = sanitizeClassName(baseName);
-    // Lua keywords cannot name a module or graph
-    if (isLua && LogicNodes::isLuaKeyword(name))
+    // A Lua keyword cannot name a module. Teal adds a few more, and those make "local record" a syntax error.
+    if (isLua && (LogicNodes::isLuaKeyword(name) || (m_creationKind == CreationKind::TEAL && ProjectUtils::isTealKeyword(name))))
         name += "Script";
 
     fs::path headerPath;
@@ -574,6 +599,8 @@ void ScriptCreateDialog::show() {
         sourcePath = makeLuaPath(name);
         if (!m_attachExisting && m_creationKind == CreationKind::LOGIC)
             sourcePath.replace_extension(".logic");
+        else if (!m_attachExisting && m_creationKind == CreationKind::TEAL)
+            sourcePath.replace_extension(".tl");
     }
 
     std::error_code existsEc;
@@ -587,7 +614,11 @@ void ScriptCreateDialog::show() {
     if (m_attachExisting) {
         std::error_code sourceEc;
         const bool validSource = fs::is_regular_file(m_existingSourcePath, sourceEc) &&
-            (isLua ? (Util::isLuaFile(m_existingSourcePath.string()) || Util::isLogicGraphFile(m_existingSourcePath.string()))
+            (isLua ? (Util::isLuaFile(FileUtils::pathToGenericUtf8(m_existingSourcePath))
+#ifdef DORIAX_TEAL
+                || Util::isTealFile(FileUtils::pathToGenericUtf8(m_existingSourcePath))
+#endif
+                || Util::isLogicGraphFile(FileUtils::pathToGenericUtf8(m_existingSourcePath)))
                    : Util::isSourceFile(m_existingSourcePath.string())) &&
             Util::isInsidePath(m_existingSourcePath, rootPath);
         std::error_code headerEc;
@@ -686,7 +717,7 @@ void ScriptCreateDialog::show() {
 
         if (allCreateFilesExist) {
             if (ImGui::Button("Attach Existing", ImVec2(alertButtonWidth, 0))) {
-                const ScriptType type = (m_creationKind == CreationKind::LUA || m_creationKind == CreationKind::LOGIC)
+                const ScriptType type = isLuaFamily(m_creationKind)
                     ? ScriptType::LUA
                     : ScriptType::CPP;
                 const std::string attachName = type == ScriptType::CPP

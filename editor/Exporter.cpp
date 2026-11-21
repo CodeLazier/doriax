@@ -11,6 +11,7 @@
 #include "util/FbxImporter.h"
 #include "util/FileUtils.h"
 #include "util/ProjectUtils.h"
+#include "util/TealCompiler.h"
 #include "util/Util.h"
 #include "util/MsBuildProgress.h"
 #include "util/ShaderHeaderBuilder.h"
@@ -1754,8 +1755,8 @@ bool editor::Exporter::copyGenerated() try {
             if (entry.is_regular_file() && excludedFiles.count(relativePath.filename().string())) {
                 continue;
             }
-            // logic graph scripts ship with the Lua or the C++ scripts
-            if (*relativePath.begin() == "logic") {
+            // logic graph and Teal scripts ship with the Lua or the C++ scripts
+            if (*relativePath.begin() == "logic" || *relativePath.begin() == "teal") {
                 continue;
             }
 
@@ -1935,6 +1936,10 @@ bool editor::Exporter::copyAssets() try {
         // Graphs are what the editor builds shaders and scripts from
         if (Util::isGraphFile(entry.path().string())) continue;
 
+        // Teal files are source. copyLua() exports their generated .lua files,
+        // so the .tl source (including .d.tl declarations) must never ship as an asset.
+        if (Util::fileExtensionLower(FileUtils::pathToGenericUtf8(entry.path())) == ".tl") continue;
+
         // Skip Lua sources already shipped in the lua tree
         if (isLuaSourceFile(entry.path()) && luaCopiedSources.count(entry.path().lexically_normal())) continue;
 
@@ -2017,21 +2022,76 @@ bool editor::Exporter::copyLua() try {
             fs::path scriptSrc = entry.path();
             scriptSrc.replace_extension(".lua");
             if (fs::exists(scriptSrc)) {
-                setError("Cannot export: " + relPath.generic_string() + " and " + scriptSrc.filename().string() + " would be the same script; rename one of them");
+                setError("Cannot export: " + FileUtils::pathToGenericUtf8(relPath) + " and " + FileUtils::pathToUtf8(scriptSrc.filename()) + " would be the same script; rename one of them");
                 return false;
             }
+            fs::path tealSrc = entry.path();
+            tealSrc.replace_extension(".tl");
+#ifdef DORIAX_TEAL
+            if (fs::exists(tealSrc)) {
+                setError("Cannot export: " + FileUtils::pathToGenericUtf8(relPath) + " and " + FileUtils::pathToUtf8(tealSrc.filename()) + " would be the same script; rename one of them");
+                return false;
+            }
+#endif
             // one written as C++ goes with the C++ scripts
             if (ProjectUtils::getLogicLanguage(project, entry.path()) == LogicLanguage::CPP) continue;
             fs::path destPath = luaDst / relPath;
             destPath.replace_extension(".lua");
+            const fs::path destRelative = fs::relative(destPath, luaDst).lexically_normal();
+            if (luaExportedPaths.count(destRelative)) {
+                setError("Cannot export: two scripts would become " + FileUtils::pathToGenericUtf8(destRelative));
+                return false;
+            }
             fs::create_directories(destPath.parent_path());
             fs::copy_file(script, destPath, fs::copy_options::overwrite_existing);
-            luaExportedPaths.insert(fs::relative(destPath, luaDst).lexically_normal());
+            luaExportedPaths.insert(destRelative);
             continue;
         }
 
+        // a Teal file ships as the Lua compiled from it
+#ifdef DORIAX_TEAL
+        if (Util::isTealFile(FileUtils::pathToGenericUtf8(entry.path()))) {
+            // A Lua or logic graph with the same stem would claim the same
+            // exported .lua destination, so fail instead of choosing silently.
+            fs::path sibling = entry.path();
+            sibling.replace_extension(".lua");
+            if (fs::exists(sibling)) {
+                setError("Cannot export: " + FileUtils::pathToGenericUtf8(relPath) + " and " + FileUtils::pathToUtf8(sibling.filename()) + " would be the same script; rename one of them");
+                return false;
+            }
+            fs::path logicSibling = entry.path();
+            logicSibling.replace_extension(".logic");
+            if (fs::exists(logicSibling) &&
+                ProjectUtils::getLogicLanguage(project, logicSibling) != LogicLanguage::CPP) {
+                setError("Cannot export: " + FileUtils::pathToGenericUtf8(relPath) + " and " + FileUtils::pathToUtf8(logicSibling.filename()) + " would be the same script; rename one of them");
+                return false;
+            }
+            std::string problem;
+            const fs::path script = TealCompiler::build(project, entry.path(), &problem);
+            if (!problem.empty() || script.empty()) {
+                setError("Cannot export: " + FileUtils::pathToGenericUtf8(relPath) + " does not compile: " + problem);
+                return false;
+            }
+            fs::path destPath = luaDst / relPath;
+            destPath.replace_extension(".lua");
+            const fs::path destRelative = fs::relative(destPath, luaDst).lexically_normal();
+            if (luaExportedPaths.count(destRelative)) {
+                setError("Cannot export: two scripts would become " + FileUtils::pathToGenericUtf8(destRelative));
+                return false;
+            }
+            fs::create_directories(destPath.parent_path());
+            fs::copy_file(script, destPath, fs::copy_options::overwrite_existing);
+            luaExportedPaths.insert(destRelative);
+            continue;
+        }
+#endif
+
         if (luaRootIsAssetsRoot && !isLuaSourceFile(entry.path())) continue;
         if (luaRootIsProjectRoot && !isLuaExportFile(entry.path())) continue;
+
+        // A .tl source that reached this point (for example a .d.tl declaration)
+        // is type metadata, not a runtime file. Only generated .lua may ship.
+        if (Util::fileExtensionLower(FileUtils::pathToGenericUtf8(entry.path())) == ".tl") continue;
 
         fs::path destPath = luaDst / relPath;
         fs::create_directories(destPath.parent_path());

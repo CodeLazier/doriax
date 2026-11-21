@@ -311,6 +311,7 @@ void CustomTextEditor::initializeLanguage() {
             break;
 
         case SyntaxLanguage::Lua:
+        case SyntaxLanguage::Teal:
             languageDef.keywords = {
                 "and", "break", "do", "else", "elseif", "end", "false", "for",
                 "function", "global", "goto", "if", "in", "local", "nil", "not",
@@ -320,6 +321,14 @@ void CustomTextEditor::initializeLanguage() {
                 "string", "number", "boolean", "table", "function", "thread",
                 "userdata"
             };
+            if (language == SyntaxLanguage::Teal) {
+                languageDef.keywords.insert({
+                    "as", "enum", "interface", "is", "record", "type", "where"
+                });
+                languageDef.types.insert({
+                    "integer", "any", "nil", "self", "void"
+                });
+            }
             // Add engine types from auto-generated header
             for (const auto& t : getEngineTypeNames()) languageDef.types.insert(t);
             languageDef.builtinFunctions = {
@@ -431,7 +440,7 @@ void CustomTextEditor::initializeSuggestions() {
         suggestions->AddSnippet("auto", "auto ${1:var} = ${2:value};", "auto variable");
         suggestions->AddSnippet("const", "const ${1:type} ${2:name} = ${3:value};", "const variable");
         suggestions->AddSnippet("constexpr", "constexpr ${1:type} ${2:name} = ${3:value};", "constexpr variable");
-    } else if (language == SyntaxLanguage::Lua) {
+    } else if (isLuaLike(language)) {
         suggestions->AddSnippet("if", "if ${1:condition} then\n\t${2}\nend", "if statement");
         suggestions->AddSnippet("ife", "if ${1:condition} then\n\t${2}\nelse\n\t${3}\nend", "if-else statement");
         suggestions->AddSnippet("elif", "elseif ${1:condition} then\n\t${2}", "elseif clause");
@@ -446,6 +455,12 @@ void CustomTextEditor::initializeSuggestions() {
         suggestions->AddSnippet("req", "local ${1:module} = require(\"${2:module}\")", "require module");
         suggestions->AddSnippet("ret", "return ${1:value}", "return statement");
         suggestions->AddSnippet("print", "print(${1:value})", "print statement");
+        if (language == SyntaxLanguage::Teal) {
+            suggestions->AddSnippet("record", "local record ${1:Name}\n\t${2}\nend", "Teal record");
+            suggestions->AddSnippet("interface", "global interface ${1:Name}\n\t${2}\nend", "Teal interface");
+            suggestions->AddSnippet("enum", "global enum ${1:Name}\n\t${2}\nend", "Teal enum");
+            suggestions->AddSnippet("type", "global type ${1:Name} = ${2:string}", "Teal type alias");
+        }
     } else if (language == SyntaxLanguage::CMake) {
         suggestions->AddSnippet("if", "if(${1:condition})\n\t${2}\nendif()", "if statement");
         suggestions->AddSnippet("ife", "if(${1:condition})\n\t${2}\nelse()\n\t${3}\nendif()", "if-else statement");
@@ -464,7 +479,7 @@ void CustomTextEditor::initializeSuggestions() {
         suggestions->AddSnippet("project", "project(${1:name}\n\tVERSION ${2:1.0.0}\n\tLANGUAGES ${3:CXX}\n)", "project definition");
     }
 
-    if (language == SyntaxLanguage::Lua || language == SyntaxLanguage::Cpp) {
+    if (isLuaLike(language) || language == SyntaxLanguage::Cpp) {
         addEngineAPISuggestions();
     }
 }
@@ -487,7 +502,7 @@ void CustomTextEditor::addEngineAPISuggestions() {
     };
 
     // "CppMethod" is unbound in Lua: suggesting it there yields a nil call at runtime.
-    const bool isLua = (language == SyntaxLanguage::Lua);
+    const bool isLua = isLuaLike(language);
 
     // In C++ the engine's top-level classes and enums are reached through "doriax::"
     if (!isLua) {
@@ -495,7 +510,12 @@ void CustomTextEditor::addEngineAPISuggestions() {
     }
 
     for (const auto& sym : apiSymbols) {
-        if (isEngineApiConstructorSymbol(sym)) continue;
+        if (isEngineApiConstructorSymbol(sym)) {
+            // Constructors are not separate completion entries; the class name
+            // already is one. They are still what Object(...) parameter hints need.
+            suggestions->AddSignatureSymbol(sym.name, sym.detail, sym.parent ? sym.parent : "");
+            continue;
+        }
         if (isLua && sym.kind && std::string(sym.kind) == "CppMethod") continue;
 
         SuggestionKind sk = SuggestionKind::Variable;
@@ -523,6 +543,7 @@ const char* CustomTextEditor::GetLanguageName() const {
     switch (language) {
         case SyntaxLanguage::Cpp: return "C++";
         case SyntaxLanguage::Lua: return "Lua";
+        case SyntaxLanguage::Teal: return "Teal";
         case SyntaxLanguage::CMake: return "CMake";
         default: return "Plain Text";
     }
@@ -795,7 +816,7 @@ int CustomTextEditor::multiLineTokenAt(const std::string& line, int i, OpenToken
         return static_cast<int>(paren) + 1 - i;
     }
 
-    if (language == SyntaxLanguage::Lua || language == SyntaxLanguage::CMake) {
+    if (isLuaLike(language) || language == SyntaxLanguage::CMake) {
         // Long brackets, [[ ]], [=[ ]=] and so on, make strings, or comments after the comment marker
         const std::string& marker = languageDef.singleLineComment;
         size_t first = (line.compare(i, marker.size(), marker) == 0) ? i + marker.size() : i;
@@ -828,7 +849,7 @@ int CustomTextEditor::scanOpenToken(const std::string& line, int i, OpenToken& o
         }
         if (line[i] == '\\') {
             if (i + 1 == len) return len;
-            skipping = (language == SyntaxLanguage::Lua && line[i + 1] == 'z');
+            skipping = (isLuaLike(language) && line[i + 1] == 'z');
             i += 2;
         } else {
             if (!std::isspace(static_cast<unsigned char>(line[i]))) skipping = false;
@@ -1655,8 +1676,9 @@ bool CustomTextEditor::opensBlock(const std::string& text, const std::vector<Tok
         last = text.substr(token.start, token.length);
 
         // Lua blocks are counted, so "if x then return end" opens none
-        if (language == SyntaxLanguage::Lua && token.type == TokenType::Keyword) {
-            if (last == "function" || last == "then" || last == "do" || last == "repeat") {
+        if (isLuaLike(language) && token.type == TokenType::Keyword) {
+            if (last == "function" || last == "then" || last == "do" || last == "repeat" ||
+                last == "record" || last == "interface" || last == "enum") {
                 ++blocks;
             } else if (last == "else") {
                 blocks = std::max(blocks, 1);
@@ -1668,7 +1690,7 @@ bool CustomTextEditor::opensBlock(const std::string& text, const std::vector<Tok
 
     if (last == "{" || last == "(" || last == "[") return true;
     // Labels, access specifiers and case
-    if (last == ":" && language != SyntaxLanguage::Lua) return true;
+    if (last == ":" && !isLuaLike(language)) return true;
     return blocks > 0;
 }
 
@@ -1676,7 +1698,7 @@ bool CustomTextEditor::closesBlock(const std::string& text) const {
     size_t start = text.find_first_not_of(" \t");
     if (start == std::string::npos) return false;
     if (text[start] == '}' || text[start] == ')' || text[start] == ']') return true;
-    if (language != SyntaxLanguage::Lua) return false;
+    if (!isLuaLike(language)) return false;
 
     size_t end = start;
     while (end < text.size() && isWordChar(text[end])) ++end;
@@ -2302,6 +2324,11 @@ std::string CustomTextEditor::inferTypeOfVariable(const std::string& varName, in
 
     std::regex luaVarRegex("\\b" + varName + "\\s*=\\s*([A-Za-z0-9_\\.:]+)(?:\\(|\\{)");
     std::regex luaLocalVarRegex("\\blocal\\s+" + varName + "\\s*=\\s*([A-Za-z0-9_\\.:]+)(?:\\(|\\{)");
+    // Teal type annotation: "local scene: Scene" or a parameter
+    // "function f(scene: Scene)". Keep it anchored to those forms so a method
+    // definition like "function obj:method()" is not read as a type.
+    std::regex tealLocalAnnotation("\\blocal\\s+" + varName + "\\s*:\\s*([A-Za-z0-9_\\.:]+)");
+    std::regex tealParamAnnotation("[,(]\\s*" + varName + "\\s*:\\s*([A-Za-z0-9_\\.:]+)");
 
     for (int i = currentLine; i >= 0; --i) {
         if (i >= static_cast<int>(lines.size())) continue;
@@ -2324,7 +2351,12 @@ std::string CustomTextEditor::inferTypeOfVariable(const std::string& varName, in
                     return typeMatch;
                 }
             }
-        } else if (language == SyntaxLanguage::Lua) {
+        } else if (isLuaLike(language)) {
+            // Teal annotations give the member-completion type directly.
+            if (std::regex_search(line, match, tealLocalAnnotation) ||
+                std::regex_search(line, match, tealParamAnnotation)) {
+                return match[1].str();
+            }
             if (std::regex_search(line, match, luaLocalVarRegex) ||
                 std::regex_search(line, match, luaVarRegex)) {
                 std::string typeName = match[1].str();
@@ -2353,7 +2385,7 @@ std::string CustomTextEditor::inferTypeBefore(int lineIndex, int endColumn) cons
     if (suggestions && suggestions->IsKnownClassOrEnum(name)) return name;
 
     // Lua's "self" and C++'s "this" stand for the class the cursor is in
-    if (name == ((language == SyntaxLanguage::Lua) ? "self" : "this")) return findEnclosingType(lineIndex);
+    if (name == (isLuaLike(language) ? "self" : "this")) return findEnclosingType(lineIndex);
 
     std::string type = inferTypeOfVariable(name, lineIndex);
     if (type.empty() && suggestions) {
@@ -2372,7 +2404,7 @@ std::string CustomTextEditor::findEnclosingType(int lineIndex) const {
         // "Engine::getDeltatime()" never passes for one
         if (line.empty() || std::isspace(static_cast<unsigned char>(line[0]))) continue;
 
-        if (language == SyntaxLanguage::Lua) {
+        if (isLuaLike(language)) {
             // "function BoxScript:onUpdate()" — the table before '.' or ':' owns the
             // method, while a plain function encloses nothing
             if (line.rfind("function ", 0) != 0 && line.rfind("local function ", 0) != 0) continue;
@@ -2451,8 +2483,36 @@ SuggestionContext CustomTextEditor::buildSuggestionContext() const {
                 ctx.afterDoubleColon = true;
                 checkCol--; // move past first ':'
             } else if (c == ':') {
-                if (language == SyntaxLanguage::Lua) {
-                    ctx.afterColon = true;
+                if (isLuaLike(language)) {
+                    // In Teal ':' starts either a method call or a type annotation.
+                    // A colon followed by whitespace/end of line and a simple
+                    // identifier on the left is treated as a type annotation.
+                    bool typeColon = false;
+                    if (language == SyntaxLanguage::Teal) {
+                        const size_t next = static_cast<size_t>(checkCol) + 1;
+                        const bool endOfLine = next >= ctx.lineContent.size();
+                        if (endOfLine || std::isspace(static_cast<unsigned char>(ctx.lineContent[next]))) {
+                            std::string before = ctx.lineContent.substr(0, checkCol);
+                            const size_t delimiter = before.find_last_of("(,");
+                            std::string candidate = before.substr(delimiter == std::string::npos ? 0 : delimiter + 1);
+                            const size_t first = candidate.find_first_not_of(" \t");
+                            const size_t last = candidate.find_last_not_of(" \t");
+                            candidate = (first == std::string::npos) ? "" : candidate.substr(first, last - first + 1);
+                            for (const char* prefix : {"local ", "global "}) {
+                                if (candidate.rfind(prefix, 0) == 0)
+                                    candidate = candidate.substr(std::strlen(prefix));
+                            }
+                            typeColon = !candidate.empty() &&
+                                (std::isalpha(static_cast<unsigned char>(candidate[0])) || candidate[0] == '_') &&
+                                std::all_of(candidate.begin(), candidate.end(), [](unsigned char ch) {
+                                    return std::isalnum(ch) || ch == '_';
+                                });
+                        }
+                    }
+                    if (typeColon)
+                        ctx.afterTypeColon = true;
+                    else
+                        ctx.afterColon = true;
                 }
             }
         }
@@ -2813,7 +2873,7 @@ void CustomTextEditor::UpdateProjectSymbols(const std::vector<ProjectSymbol>& sy
     suggestions->ClearSymbols();
     suggestions->ClearInheritance();
 
-    if (language == SyntaxLanguage::Lua || language == SyntaxLanguage::Cpp) {
+    if (isLuaLike(language) || language == SyntaxLanguage::Cpp) {
         addEngineAPISuggestions();
     }
 

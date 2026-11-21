@@ -27,8 +27,14 @@ namespace doriax::editor {
         None,
         Cpp,
         Lua,
+        Teal,
         CMake
     };
+
+    // Teal uses Lua's grammar for comments, strings, blocks and the script API.
+    inline bool isLuaLike(SyntaxLanguage language) {
+        return language == SyntaxLanguage::Lua || language == SyntaxLanguage::Teal;
+    }
 
     // Token types for syntax highlighting
     enum class TokenType {

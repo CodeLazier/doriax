@@ -113,6 +113,13 @@ public:
     static std::string getShaderFunctionTemplate();
     // a script graph with the two events most scripts start from
     static std::string getLogicGraphTemplate();
+    // a Teal script attached to an entity, with the exposed properties and events
+    static std::string getTealScriptTemplate(const std::string& moduleName);
+    // a standalone Teal module, not an entity script. requireName includes the
+    // directory modules, e.g. "scripts.MyModule" for a file in the scripts folder.
+    static std::string getTealModuleTemplate(const std::string& moduleName, const std::string& requireName);
+    // words Teal reserves beyond Lua's: "local record <word>" would not parse
+    static bool isTealKeyword(const std::string& word);
     // a logic graph's language: its own, else the project's
     static LogicLanguage getLogicLanguage(const Project* project, const GraphDocument& graph);
     static LogicLanguage getLogicLanguage(const Project* project, const std::filesystem::path& graph);

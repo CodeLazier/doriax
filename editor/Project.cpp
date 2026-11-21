@@ -54,6 +54,7 @@
 #include "util/ExternalEditor.h"
 #include "LuaDebugger.h"
 #include "util/ProjectUtils.h"
+#include "util/TealCompiler.h"
 #include "util/Util.h"
 #include "json.hpp"
 #include "tiny_gltf.h"
@@ -372,9 +373,13 @@ void editor::Project::overrideExternalRefComponents(EntityRegistry* scene, Entit
 editor::Project::Project(){
     resetConfigs();
 
-    // a logic graph on an entity runs the script written from it
+    // a logic graph or Teal file on an entity runs the Lua written from it
     LuaBinding::setScriptPathResolver([this](const std::string& path) {
+#ifdef DORIAX_TEAL
+        if (!Util::isLogicGraphFile(path) && !Util::isTealFile(path))
+#else
         if (!Util::isLogicGraphFile(path))
+#endif
             return std::string();
         return FileUtils::pathToGenericUtf8(resolveLuaSource(FileUtils::pathFromUtf8(path)));
     });
@@ -1360,15 +1365,20 @@ void editor::Project::remapEntityBundleFilePath(const std::filesystem::path& old
     }
 }
 
-void editor::Project::remapScriptFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath) {
+void editor::Project::remapScriptFilePath(const std::filesystem::path& oldPath, const std::filesystem::path& newPath, bool isDirectory) {
     if (projectPath.empty() || oldPath.empty() || newPath.empty()) {
         return;
     }
 
-    // scripts of renamed logic graphs are written again
+    // Generated Lua for a renamed logic graph or Teal file is written again from the new path.
     if (Util::isLogicGraphFile(oldPath.string()) || oldPath.extension().empty()) {
         ProjectUtils::removeLogicScript(this, oldPath);
     }
+#ifdef DORIAX_TEAL
+    if (Util::isTealFile(FileUtils::pathToGenericUtf8(oldPath)) || isDirectory) {
+        TealCompiler::remove(this, oldPath, isDirectory);
+    }
+#endif
 
     // breakpoints go with the Lua files, open in an editor or not
     debugger.renameBreakpoints(FileUtils::pathToGenericUtf8(normalizeToLuaRelative(oldPath)), FileUtils::pathToGenericUtf8(normalizeToLuaRelative(newPath)));
@@ -1575,14 +1585,20 @@ void editor::Project::cleanupEntityBundleFilePath(const std::filesystem::path& d
     }
 }
 
-void editor::Project::cleanupScriptFilePath(const std::filesystem::path& deletedPath) {
+void editor::Project::cleanupScriptFilePath(const std::filesystem::path& deletedPath, bool isDirectory) {
     if (projectPath.empty() || deletedPath.empty()) {
         return;
     }
 
+    // Drop generated Lua left behind by a deleted logic graph or Teal file.
     if (Util::isLogicGraphFile(deletedPath.string()) || deletedPath.extension().empty()) {
         ProjectUtils::removeLogicScript(this, deletedPath);
     }
+#ifdef DORIAX_TEAL
+    if (Util::isTealFile(FileUtils::pathToGenericUtf8(deletedPath)) || isDirectory) {
+        TealCompiler::remove(this, deletedPath, isDirectory);
+    }
+#endif
 
     for (auto& sceneProject : scenes) {
         if (!sceneProject.scene) {
@@ -2788,9 +2804,14 @@ std::filesystem::path editor::Project::resolveLuaPath(const std::filesystem::pat
     return resolveAgainstRoot(getLuaPath(), luaRelative);
 }
 
+// A logic graph or a Teal file runs as the Lua compiled from it.
 std::filesystem::path editor::Project::resolveLuaSource(const std::filesystem::path& luaRelative) const{
     if (Util::isLogicGraphFile(FileUtils::pathToGenericUtf8(luaRelative)))
         return ProjectUtils::buildLogicScript(this, resolveLuaPath(luaRelative));
+#ifdef DORIAX_TEAL
+    if (Util::isTealFile(FileUtils::pathToGenericUtf8(luaRelative)))
+        return TealCompiler::build(this, resolveLuaPath(luaRelative));
+#endif
     return resolveLuaPath(luaRelative);
 }
 
@@ -2818,9 +2839,9 @@ static bool holdsOnlyAssets(const std::filesystem::path& directory){
             continue;
         }
 
-        const std::string path = entry.path().string();
+        const std::string path = editor::FileUtils::pathToGenericUtf8(entry.path());
         if (editor::Util::isSceneFile(path) || editor::Util::isBundleFile(path) || editor::Util::isMaterialFile(path) ||
-            editor::Util::isScriptFile(path) || editor::Util::isShaderFile(path)){
+            editor::Util::isScriptFile(path) || editor::Util::isTealFile(path) || editor::Util::isShaderFile(path)){
             return false;
         }
     }
@@ -5491,6 +5512,59 @@ std::vector<std::string> editor::Project::collectLogicLuaScripts() const {
     return scripts;
 }
 
+// Same as a logic graph: the generated project rewrites the scene path to .lua.
+// This lists the names that resolver has to recognize.
+std::vector<std::string> editor::Project::collectTealLuaScripts() const {
+#ifndef DORIAX_TEAL
+    return {};
+#else
+    std::vector<std::string> scripts;
+    std::set<std::string> outputNames;
+    std::error_code ec;
+    try {
+    for (auto it = fs::recursive_directory_iterator(getLuaPath(), fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        const std::string name = FileUtils::pathToUtf8(it->path().filename());
+        if (it.depth() == 0 && it->is_directory(ec) && (name.empty() || name[0] == '.' || name == "build")) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        if (!it->is_regular_file(ec) || !Util::isTealFile(name)) continue;
+        const fs::path source = it->path();
+        // A .lua beside the .tl is the script that runs. Do not also publish the generated one.
+        if (fs::exists(fs::path(source).replace_extension(".lua"), ec)) continue;
+        // A logic graph with the same stem that runs as Lua already claims that
+        // .lua name; publishing both would make one of them unreachable.
+        const fs::path logicSibling = fs::path(source).replace_extension(".logic");
+        if (fs::exists(logicSibling, ec) &&
+            ProjectUtils::getLogicLanguage(this, logicSibling) != LogicLanguage::CPP) {
+            Out::warning("Teal script \"%s\" is shadowed by a logic graph with the same name",
+                         FileUtils::pathToGenericUtf8(source).c_str());
+            continue;
+        }
+
+        const fs::path script = TealCompiler::build(this, source);
+        if (!script.empty() && fs::exists(script, ec)) {
+            const std::string outputName = FileUtils::pathToGenericUtf8(normalizeToLuaRelative(source).replace_extension(".lua"));
+            // On a case-sensitive file system Foo.tl and foo.tl are different
+            // sources but both become Foo.lua/foo.lua destinations.
+            if (outputNames.insert(outputName).second) {
+                scripts.push_back(outputName);
+            } else {
+                Out::error("Teal script \"%s\" compiles to the same Lua name as another script",
+                           FileUtils::pathToGenericUtf8(source).c_str());
+            }
+        }
+    }
+    std::sort(scripts.begin(), scripts.end());
+    return scripts;
+    } catch (const std::exception& e) {
+        Out::error("Could not collect Teal scripts: %s", e.what());
+        return scripts;
+    }
+#endif
+}
+
 std::vector<editor::SceneScriptSource> editor::Project::collectLogicCppScripts() const {
     std::error_code ec;
 
@@ -5611,8 +5685,13 @@ void editor::Project::copyEngineApiToProject() {
                 const bool isPlatformSource =
                     !relPath.empty() && relPath.begin()->string() == "platform" &&
                     (ext == ".cpp" || ext == ".mm" || ext == ".m");
-                // definitions for lua-language-server
-                const bool isLuaApi = !relPath.empty() && relPath.begin()->string() == "lua-api" && ext == ".lua";
+                // Engine API for the language service and for .tl type checking. .d.tl is a .tl file.
+                const bool isLuaApi = !relPath.empty() && relPath.begin()->string() == "lua-api" &&
+                    (ext == ".lua"
+#ifdef DORIAX_TEAL
+                     || ext == ".tl"
+#endif
+                    );
 
                 if (ext == ".h" || ext == ".hpp" || ext == ".inl" || ext == ".glsl" || ext == ".frag" || ext == ".vert" || isPlatformSource || isLuaApi) {
                     auto destPath = engineApiDest / relPath;
@@ -6814,7 +6893,7 @@ void editor::Project::configureGenerator() {
 
     std::vector<SceneScriptSource> mergedCppScripts = collectAllSceneCppScripts();
     std::vector<BundleSceneInfo> bundleBuildInfos = collectAllBundles();
-    generator.configure(scenesToConfig, libName, mergedCppScripts, bundleBuildInfos, getProjectPath(), getProjectInternalPath(), getAssetsPath(), getLuaPath(), getScriptDirs(), getCxxStandard(), scalingMode, textureStrategy, canvasWidth, canvasHeight, vsyncEnabled, getWindowSettings(), loadingSettings, collectLogicLuaScripts());
+    generator.configure(scenesToConfig, libName, mergedCppScripts, bundleBuildInfos, getProjectPath(), getProjectInternalPath(), getAssetsPath(), getLuaPath(), getScriptDirs(), getCxxStandard(), scalingMode, textureStrategy, canvasWidth, canvasHeight, vsyncEnabled, getWindowSettings(), loadingSettings, collectLogicLuaScripts(), collectTealLuaScripts());
 }
 
 void editor::Project::updateGeneratedSources() {
@@ -7858,6 +7937,21 @@ bool editor::Project::updateScriptProperties(SceneProject* sceneProject, Entity 
         // Lua scripts: load properties from Lua file
         if (scriptEntry.type == ScriptType::LUA) {
             if (scriptEntry.path.empty()) continue;
+
+            // Teal source cannot be parsed as Lua. Compile it, then read properties from the result.
+#ifdef DORIAX_TEAL
+            if (Util::isTealFile(scriptEntry.path)) {
+                const fs::path compiled = resolveLuaSource(scriptEntry.path);
+                if (!compiled.empty()) {
+                    ScriptEntry parsedEntry = scriptEntry;
+                    ProjectUtils::loadLuaScriptProperties(parsedEntry, compiled.string());
+                    hasChanges |= mergeScriptProperties(scriptEntry.properties, parsedEntry.properties);
+                }
+                continue;
+            }
+#else
+            if (Util::isTealFile(scriptEntry.path)) continue;
+#endif
 
             fs::path fullPath = resolveLuaSource(scriptEntry.path);
 
@@ -10356,7 +10450,7 @@ void editor::Project::runPlayStartup(const std::shared_ptr<PlaySession>& session
 
         std::vector<SceneScriptSource> mergedCppScripts = collectAllSceneCppScripts();
         std::vector<BundleSceneInfo> bundleBuildInfos = collectAllBundles();
-        generator.configure(scenesToGenerate, libName, mergedCppScripts, bundleBuildInfos, getProjectPath(), getProjectInternalPath(), getAssetsPath(), getLuaPath(), getScriptDirs(), getCxxStandard(), scalingMode, textureStrategy, canvasWidth, canvasHeight, vsyncEnabled, getWindowSettings(), loadingSettings, collectLogicLuaScripts());
+        generator.configure(scenesToGenerate, libName, mergedCppScripts, bundleBuildInfos, getProjectPath(), getProjectInternalPath(), getAssetsPath(), getLuaPath(), getScriptDirs(), getCxxStandard(), scalingMode, textureStrategy, canvasWidth, canvasHeight, vsyncEnabled, getWindowSettings(), loadingSettings, collectLogicLuaScripts(), collectTealLuaScripts());
         if (hasMissingSceneSources()) {
             generatedSourcesDirty.store(true);
         }

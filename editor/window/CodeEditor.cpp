@@ -143,6 +143,9 @@ std::string luaPropertyClass(const std::string& type) {
     return type;
 }
 
+// Implemented below; declared here because function symbols are parsed before it.
+std::string parameterList(const std::string& line, size_t paren);
+
 void parseLuaSymbols(const std::string& content, std::unordered_set<std::string>& seen, std::vector<ProjectSymbol>& out) {
     std::istringstream stream(content);
     std::string line;
@@ -151,9 +154,84 @@ void parseLuaSymbols(const std::string& content, std::unordered_set<std::string>
     std::string propertyName;
     std::string propertyType;
     int propertyDepth = 0;
+    // Teal record/interface body: fields become member completions of its type.
+    std::string recordName;
+    std::string recordBase;
+    int recordDepth = 0;
 
     while (std::getline(stream, line)) {
-        if (line.compare(skipSpaces(line, 0), 2, "--") == 0) continue;
+        const std::string trimmed = line.substr(skipSpaces(line, 0));
+        if (trimmed.compare(0, 2, "--") == 0) continue;
+
+        if (recordDepth > 0) {
+            if (trimmed == "end" || trimmed.rfind("end ", 0) == 0 || trimmed.rfind("end\t", 0) == 0) {
+                if (--recordDepth == 0) {
+                    // LuaScript members are part of the engine contract and are not
+                    // repeated by the generated engine API header.
+                    if (recordBase == "LuaScript") {
+                        if (seen.insert(recordName + ".scene").second)
+                            out.push_back({"scene", editor::SuggestionKind::Field, "Scene", recordName, "Scene"});
+                        if (seen.insert(recordName + ".entity").second)
+                            out.push_back({"entity", editor::SuggestionKind::Field, "integer", recordName, "integer"});
+                    }
+                    recordName.clear();
+                    recordBase.clear();
+                }
+                continue;
+            }
+
+            size_t colon = trimmed.find(':');
+            if (colon != std::string::npos) {
+                std::string field = trimmed.substr(0, colon);
+                while (!field.empty() && std::isspace(static_cast<unsigned char>(field.back()))) field.pop_back();
+                size_t typeStart = skipSpaces(trimmed, colon + 1);
+                std::string type = trimmed.substr(typeStart);
+                size_t comment = type.find("--");
+                if (comment != std::string::npos) type.resize(comment);
+                while (!type.empty() && std::isspace(static_cast<unsigned char>(type.back()))) type.pop_back();
+
+                const bool identifier = !field.empty() &&
+                    (std::isalpha(static_cast<unsigned char>(field[0])) || field[0] == '_') &&
+                    std::all_of(field.begin(), field.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '_';
+                    });
+                if (identifier && !type.empty() && seen.insert(recordName + "." + field).second) {
+                    out.push_back({field, editor::SuggestionKind::Field, type, recordName, type});
+                }
+            }
+            continue;
+        }
+
+        static const char* recordPrefixes[] = {
+            "local record ", "global record ", "global interface ", "global enum "
+        };
+        bool startedRecord = false;
+        for (const char* prefix : recordPrefixes) {
+            const size_t prefixLen = std::strlen(prefix);
+            if (trimmed.compare(0, prefixLen, prefix) != 0) continue;
+
+            size_t start = skipSpaces(trimmed, prefixLen);
+            size_t end = scanWord(trimmed, start);
+            std::string name = trimmed.substr(start, end - start);
+            if (!name.empty() && (std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_')) {
+                if (seen.insert(name).second) {
+                    out.push_back({name, editor::SuggestionKind::Class, "Teal record", "", ""});
+                }
+                seen.insert("table " + name);
+                recordName = name;
+                recordBase.clear();
+                const size_t isPos = trimmed.find(" is ", end);
+                if (isPos != std::string::npos) {
+                    const size_t baseStart = skipSpaces(trimmed, isPos + 4);
+                    const size_t baseEnd = scanWord(trimmed, baseStart);
+                    recordBase = trimmed.substr(baseStart, baseEnd - baseStart);
+                }
+                recordDepth = 1;
+                startedRecord = true;
+            }
+            break;
+        }
+        if (startedRecord) continue;
 
         if (propertyOwner.empty()) {
             // "local BoxScript = {" opens the script table
@@ -217,9 +295,17 @@ void parseLuaSymbols(const std::string& content, std::unordered_set<std::string>
                     if (seen.insert("table " + owner).second) {
                         out.push_back({owner, editor::SuggestionKind::Class, "script table", "", ""});
                     }
-                    out.push_back({method, editor::SuggestionKind::Method, owner + ":" + method + "()", owner, ""});
+                    // Keep the real parameter list so parameter hints work for
+                    // project-defined functions, including Teal type annotations.
+                    const size_t paren = line.find('(', end);
+                    const std::string params = (paren == std::string::npos) ? "" : parameterList(line, paren);
+                    out.push_back({method, editor::SuggestionKind::Method,
+                                   owner + "." + method + "(" + params + ")", owner, ""});
                 } else {
-                    out.push_back({name, editor::SuggestionKind::Function, "project function", "", ""});
+                    const size_t paren = line.find('(', end);
+                    const std::string params = (paren == std::string::npos) ? "" : parameterList(line, paren);
+                    out.push_back({name, editor::SuggestionKind::Function,
+                                   name + "(" + params + ")", "", ""});
                 }
             }
         }
@@ -448,6 +534,10 @@ editor::SyntaxLanguage languageForPath(const fs::path& path) {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     if (ext == ".lua") return editor::SyntaxLanguage::Lua;
+#ifdef DORIAX_TEAL
+    // Teal has its own language mode; it shares Lua's grammar and engine API.
+    if (ext == ".tl") return editor::SyntaxLanguage::Teal;
+#endif
     // GLSL is close enough to reuse the C++ highlighter
     if (ext == ".c" || editor::Util::isSourceFile(ext) || editor::Util::isHeaderFile(ext) || editor::Util::isShaderFile(ext))
         return editor::SyntaxLanguage::Cpp;
@@ -470,14 +560,18 @@ void collectProjectSources(const fs::path& projectPath, const std::unordered_set
         }
 
         // '.doriax' holds the engine copy and the generated resources, 'build' the artifacts
-        const std::string filename = entry.path().filename().string();
+        const std::string filename = editor::FileUtils::pathToUtf8(entry.path().filename());
         if (filename.rfind('.', 0) == 0 || filename == "build") {
             if (entry.is_directory(ec)) it.disable_recursion_pending();
             continue;
         }
 
-        const std::string path = entry.path().string();
+        const std::string path = editor::FileUtils::pathToGenericUtf8(entry.path());
+#ifdef DORIAX_TEAL
+        if (!entry.is_regular_file() || (!editor::Util::isScriptFile(path) && !editor::Util::isTealFile(path))) continue;
+#else
         if (!entry.is_regular_file() || !editor::Util::isScriptFile(path)) continue;
+#endif
 
         std::error_code relEc;
         fs::path relPath = fs::relative(entry.path(), projectPath, relEc);
@@ -486,7 +580,12 @@ void collectProjectSources(const fs::path& projectPath, const std::unordered_set
         std::string content;
         if (!readFile(entry.path(), content)) continue;
 
+        // Teal files contribute record fields and module symbols to completion.
+#ifdef DORIAX_TEAL
+        if (editor::Util::isTealFile(path) || editor::Util::isLuaFile(path)) {
+#else
         if (editor::Util::isLuaFile(path)) {
+#endif
             luaContents.push_back(std::move(content));
         } else {
             cppContents.push_back(std::move(content));
@@ -558,7 +657,7 @@ void editor::CodeEditor::updateAllProjectSymbols() {
         openFiles.insert(key);
         if (!instance.editor) continue;
 
-        if (instance.languageType == SyntaxLanguage::Lua) {
+        if (editor::isLuaLike(instance.languageType)) {
             luaContents.push_back(instance.editor->GetText());
         } else if (instance.languageType == SyntaxLanguage::Cpp) {
             cppContents.push_back(instance.editor->GetText());
@@ -614,7 +713,7 @@ void editor::CodeEditor::applyParsedProjectSymbols() {
     for (auto& [key, instance] : editors) {
         if (!instance.editor) continue;
 
-        if (instance.languageType == SyntaxLanguage::Lua) {
+        if (editor::isLuaLike(instance.languageType)) {
             instance.editor->UpdateProjectSymbols(luaSymbols);
         } else if (instance.languageType == SyntaxLanguage::Cpp) {
             instance.editor->UpdateProjectSymbols(cppSymbols);
@@ -685,8 +784,15 @@ void editor::CodeEditor::checkExternalScriptChanges() {
                 if (scriptEntry.type == ScriptType::CPP && !scriptEntry.headerPath.empty()) {
                     referenced.insert(scriptEntry.headerPath);
                 } else if (scriptEntry.type == ScriptType::LUA && !scriptEntry.path.empty()) {
-                    // Stored relative to the Lua root, the watch list is project-relative
-                    referenced.insert(toRelativePath(project->resolveLuaSource(scriptEntry.path).string()));
+                    // Teal is watched at the .tl file. The generated Lua changes because of that save.
+#ifdef DORIAX_TEAL
+                    const fs::path watched = Util::isTealFile(scriptEntry.path)
+                        ? project->resolveLuaPath(scriptEntry.path)
+                        : project->resolveLuaSource(scriptEntry.path);
+#else
+                    const fs::path watched = project->resolveLuaSource(scriptEntry.path);
+#endif
+                    referenced.insert(toRelativePath(watched.string()));
                 }
             }
         }
@@ -823,13 +929,26 @@ void editor::CodeEditor::updateScriptPropertiesForPath(const fs::path& relFilepa
                 // Lua entries are stored relative to the Lua root
                 bool matchesFile = (scriptEntry.type == ScriptType::CPP) ? (scriptEntry.headerPath == relPathStr)
                                                                         : (project->resolveLuaSource(scriptEntry.path).lexically_normal() == fullPath.lexically_normal());
+                // resolveLuaSource returns the generated .lua. A save of the .tl has to match the source itself.
+#ifdef DORIAX_TEAL
+                if (!matchesFile && scriptEntry.type == ScriptType::LUA && Util::isTealFile(scriptEntry.path)) {
+                    matchesFile = project->resolveLuaPath(scriptEntry.path).lexically_normal() == fullPath.lexically_normal();
+                }
+#endif
                 if (!matchesFile)
                     continue;
 
                 std::vector<ScriptEntry> newScripts = scriptComponent->scripts;
 
-                // Ignore edits that do not change script properties
-                if (project->updateScriptProperties(&sceneProject, entity, newScripts, inMemoryContent, fullPath.string())) {
+                // Teal source is not Lua. Properties are read from the compiled file after the save.
+#ifdef DORIAX_TEAL
+                const bool tealSource = Util::isTealFile(FileUtils::pathToGenericUtf8(fullPath));
+#else
+                const bool tealSource = false;
+#endif
+                if (project->updateScriptProperties(&sceneProject, entity, newScripts,
+                        tealSource ? std::string() : inMemoryContent,
+                        tealSource ? std::string() : fullPath.string())) {
                     PropertyCmd<std::vector<ScriptEntry>> propertyCmd(project, sceneProject.id, entity, ComponentType::ScriptComponent, "scripts", newScripts);
                     propertyCmd.execute();
                 }
@@ -957,7 +1076,7 @@ fs::path editor::CodeEditor::findCompanionFile(const fs::path& relPath) const {
 void editor::CodeEditor::getScriptEventFiles(const EditorInstance& instance, std::vector<fs::path>& paths, std::vector<std::string>& texts) const {
     paths = {instance.filepath};
     texts = {instance.editor->GetText()};
-    if (instance.languageType == SyntaxLanguage::Lua) return;
+    if (editor::isLuaLike(instance.languageType)) return;
 
     fs::path companion = findCompanionFile(instance.filepath);
     if (companion.empty()) return;
@@ -978,7 +1097,7 @@ void editor::CodeEditor::showEventsButton(const EditorInstance& instance) {
         std::vector<fs::path> paths;
         std::vector<std::string> texts;
         getScriptEventFiles(instance, paths, texts);
-        if (instance.languageType == SyntaxLanguage::Lua) {
+        if (editor::isLuaLike(instance.languageType)) {
             eventMenuScan = ScriptEvents::scanLua(texts[0]);
         } else {
             eventMenuScan = ScriptEvents::scanCpp(texts, instance.filepath.stem().string());
@@ -995,7 +1114,7 @@ void editor::CodeEditor::showEventsButton(const EditorInstance& instance) {
         return;
     }
 
-    const bool lua = instance.languageType == SyntaxLanguage::Lua;
+    const bool lua = editor::isLuaLike(instance.languageType);
     const std::vector<ScriptEvent>& events = ScriptEvents::getEvents();
     for (const ScriptEventSourceInfo& source : ScriptEvents::getSources()) {
         if (source.source == ScriptEventSource::UI || source.source == ScriptEventSource::Physics2D ||
@@ -1037,7 +1156,7 @@ void editor::CodeEditor::addScriptEvent(const std::string& filepath, size_t even
     getScriptEventFiles(it->second, paths, texts);
 
     ScriptEventChange change;
-    if (it->second.languageType == SyntaxLanguage::Lua) {
+    if (editor::isLuaLike(it->second.languageType)) {
         change = ScriptEvents::addLua(texts[0], event);
     } else {
         change = ScriptEvents::addCpp(texts, it->second.filepath.stem().string(), event);
@@ -1592,7 +1711,12 @@ void editor::CodeEditor::updateDebugger(EditorInstance& instance) {
 
 void editor::CodeEditor::openScript(const std::string& filepath, int line, int column) {
     const std::string key = toRelativePath(filepath);
+    // A Teal file opens in the external script editor too, when one is configured.
+#ifdef DORIAX_TEAL
+    if (ExternalEditor::isEnabled() && (Util::isScriptFile(key) || Util::isTealFile(key))) {
+#else
     if (ExternalEditor::isEnabled() && Util::isScriptFile(key)) {
+#endif
         if (ExternalEditor::openFile(project->getProjectPath(), resolveFilepath(key).lexically_normal(), line, column)) {
             return;
         }
@@ -1790,8 +1914,12 @@ void editor::CodeEditor::show() {
 
             // Full-height buttons vertically centered on the status row, overlapping the
             // spacing above and below so the row keeps its text-only height
-            std::string filepath = instance.filepath.string();
+            std::string filepath = FileUtils::pathToGenericUtf8(instance.filepath);
+#ifdef DORIAX_TEAL
+            bool showEvents = Util::isLuaFile(filepath) || Util::isTealFile(filepath) || Util::isHeaderFile(filepath) || Util::isSourceFile(filepath);
+#else
             bool showEvents = Util::isLuaFile(filepath) || Util::isHeaderFile(filepath) || Util::isSourceFile(filepath);
+#endif
             float framePadding = ImGui::GetStyle().FramePadding.x * 2.0f;
             float buttonsWidth = ImGui::CalcTextSize(ICON_FA_GEAR).x + framePadding;
             if (showEvents) {
@@ -1808,6 +1936,8 @@ void editor::CodeEditor::show() {
             showSettingsButton();
             ImGui::SetCursorPosY(statusRowY + ImGui::GetTextLineHeightWithSpacing());
 
+            // Teal breakpoints follow the generated Lua, not the .tl line
+            // numbers, so the Lua debugger stays off for .tl buffers.
             if (instance.languageType == SyntaxLanguage::Lua) {
                 if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
                     instance.editor->ToggleBreakpoint(line);
@@ -1820,7 +1950,7 @@ void editor::CodeEditor::show() {
             instance.editor->Render("TextEditor");
             ImGui::PopFont();
 
-            if ((instance.languageType == SyntaxLanguage::Lua || instance.languageType == SyntaxLanguage::Cpp) && ImGui::BeginDragDropTarget()) {
+            if ((editor::isLuaLike(instance.languageType) || instance.languageType == SyntaxLanguage::Cpp) && ImGui::BeginDragDropTarget()) {
                 bool isCppSource = (instance.languageType == SyntaxLanguage::Cpp) && !Util::isHeaderFile(instance.filepath.string());
 
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("entity")) {
@@ -1828,7 +1958,7 @@ void editor::CodeEditor::show() {
                         Backend::getApp().registerAlert("Drop Entity", "Entity properties must be added to the header file (.h), not the source file (.cpp).");
                     } else if (payload->DataSize >= sizeof(EntityPayload)) {
                         const EntityPayload* entityPayload = static_cast<const EntityPayload*>(payload->Data);
-                        if (instance.languageType == SyntaxLanguage::Lua)
+                        if (editor::isLuaLike(instance.languageType))
                             insertLuaEntityProperty(instance, entityPayload->entity, entityPayload->entitySceneId);
                         else
                             insertCppEntityProperty(instance, entityPayload->entity, entityPayload->entitySceneId);

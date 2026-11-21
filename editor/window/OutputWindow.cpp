@@ -44,9 +44,13 @@ static ImVec4 GetLogTypeColor(LogType type) {
     }
 }
 
-// A source file the editor opens, or ""
+// A source file the editor opens, or "". .tl is included so a Teal diagnostic is clickable.
 static std::string resolveLinkPath(std::string name) {
-    if (!Util::isScriptFile(name) && !Util::isShaderFile(name)) {
+    if (!Util::isScriptFile(name) && !Util::isShaderFile(name)
+#ifdef DORIAX_TEAL
+        && !Util::isTealFile(name)
+#endif
+    ) {
         return "";
     }
 

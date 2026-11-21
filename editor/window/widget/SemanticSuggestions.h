@@ -55,6 +55,7 @@ namespace doriax::editor {
         bool afterArrow = false;             // Is cursor after '->' (pointer member access)
         bool afterDoubleColon = false;       // Is cursor after '::' (scope resolution)
         bool afterColon = false;             // Is cursor after ':' (Lua method access)
+        bool afterTypeColon = false;         // Teal type annotation: "local x: " / "arg: "
         std::string targetType;      // Inferred type for member completion filtering
         std::string targetNamespace; // Namespace before '::' — lists its top-level symbols
         std::string enclosingType;   // Class the cursor is inside — its members need no receiver
@@ -83,6 +84,9 @@ namespace doriax::editor {
         // Document context
         void UpdateDocumentWords(const std::vector<std::string>& lines);
         void AddSymbol(const std::string& name, SuggestionKind kind, const std::string& detail = "", const std::string& parentType = "", const std::string& typeInfo = "", const std::string& namespaceName = "");
+        // Signature-only entries: searched by FindSignatures but never offered as
+        // completion items. Engine constructors (Object(Scene), ...) live here.
+        void AddSignatureSymbol(const std::string& name, const std::string& detail, const std::string& parentType = "");
         void ClearSymbols();
 
         // Inheritance
@@ -124,6 +128,7 @@ namespace doriax::editor {
         std::unordered_set<std::string> documentWords;
         std::vector<SuggestionItem> snippets;
         std::vector<SuggestionItem> symbols;
+        std::vector<SuggestionItem> signatureSymbols;
         std::unordered_set<std::string> namespaces;
 
         // Inheritance map: className -> parentClassName

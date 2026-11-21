@@ -19,6 +19,7 @@
 #include "util/FileDialogs.h"
 #include "util/FileUtils.h"
 #include "util/ProjectUtils.h"
+#include "util/TealCompiler.h"
 #include "util/SystemFonts.h"
 #include "util/Util.h"
 
@@ -2204,6 +2205,10 @@ void editor::App::engineInit(int argc, char** argv) {
     }
     reportLoadingProgress("Initializing engine...");
     Engine::systemInit(argc, argv, new editor::Platform(&project));
+    // systemInit replaces package.searchers, so the Teal searcher has to be installed after it.
+#ifdef DORIAX_TEAL
+    editor::TealCompiler::installRequireSearcher(&project);
+#endif
 
     Engine::pauseGameEvents(true);
 

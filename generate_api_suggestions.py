@@ -1294,7 +1294,8 @@ def _lua_class(name, cls, members, doc, names, cpp_methods, callbacks, types):
     for s in members:
         if s.kind != 'Constructor':
             continue
-        params = s.detail[s.detail.find('(') + 1:-1]
+        open_paren = s.detail.find('(')
+        params = s.detail[open_paren + 1:-1] if open_paren >= 0 else ''
         bound = [_param_type(p) for p in _split_types(params)]
         header = next((c for c in constructors.get(cls.cpp_class or name, [])
                        if [_param_type(p) for p in _split_types(c)] == bound), params)
@@ -1369,6 +1370,618 @@ def generate_lua_stubs(symbols, events, cpp_methods, docs, output_path):
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     print(f'[generate_api_suggestions] Generated {output_path} ({len(types) - types.count("any")} typed, {types.count("any")} any)')
+
+
+# ── Teal declaration file (teal-types global environment) ─────────────────
+
+# Teal keywords. LUA_KEYWORDS already covers the Lua ones.
+TEAL_KEYWORDS = LUA_KEYWORDS | {'record', 'enum', 'interface', 'type', 'as', 'where'}
+
+TEAL_PRELUDE = [
+    '-- Doriax engine API for Teal, generated from the engine bindings.',
+    '-- Declaration file, in the teal-types global-environment form:',
+    '-- https://github.com/teal-language/teal-types',
+    '-- https://teal-language.org/book/latest/declaration_files.html',
+    '-- The compiler loads this as its global environment. These names already exist in the engine.',
+    '-- An enum constant has the nominal type Enum.Value. At runtime that value is the engine integer.',
+    '',
+]
+
+
+def _teal_field(name):
+    """A record field. Keywords and other illegal identifiers are written as ["name"]."""
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name) and name not in TEAL_KEYWORDS:
+        return name
+    return '["' + name.replace('\\', '\\\\').replace('"', '\\"') + '"]'
+
+
+def _teal_comment(text):
+    return [f'-- {line}' if line else '--' for line in text.split('\n')] if text else []
+
+
+def _teal_fun(params, returns):
+    """params is a list of (name, type, optional)."""
+    parts = []
+    for name, typ, optional in params:
+        if name == '...':
+            parts.append(f'...: {typ}')
+        else:
+            parts.append(f'{name}{"?" if optional else ""}: {typ}')
+    text = 'function(' + ', '.join(parts) + ')'
+    if returns:
+        text += ': ' + returns
+    return text
+
+
+def _teal_type(cpp, names, enum_names):
+    """A Teal type. Enum values are Enum.Value, arrays are {T}, maps are {K: V}. An empty string is void."""
+    pointer_to_char = re.search(r'\bchar\s*\*', cpp or '')
+    t = _bare_type(cpp or '')
+    if pointer_to_char or t in ('string', 'wstring', 'char'):
+        return 'string'
+    if t in ('', 'void'):
+        return ''
+    if t == 'bool':
+        return 'boolean'
+    if t in ('float', 'double'):
+        return 'number'
+    if t in LUA_INTEGERS:
+        return 'integer'
+    key = _type_key(t)
+    if key in names and names[key] in enum_names:
+        return names[key] + '.Value'
+    if key in names:
+        return names[key]
+    m = RE_CALLBACK.match(t)
+    if m:
+        params, returns = _teal_callback_signature(m.group(1), names, enum_names)
+        return _teal_fun([(n, typ, False) for n, typ in params], returns)
+    m = re.match(r'^(?:vector|array|list|deque|set|unordered_set)\s*<(.*)>$', t)
+    if m:
+        inner = _teal_type(_split_types_raw(m.group(1))[0], names, enum_names) or 'any'
+        return '{' + inner + '}'
+    m = re.match(r'^(?:map|unordered_map)\s*<(.*)>$', t)
+    if m:
+        key_t, value_t = (_split_types_raw(m.group(1)) + ['', ''])[:2]
+        key_teal = _teal_type(key_t, names, enum_names) or 'any'
+        value_teal = _teal_type(value_t, names, enum_names) or 'any'
+        return '{' + key_teal + ': ' + value_teal + '}'
+    bare = names.get(t) or names.get(t.split('::')[-1])
+    if bare in enum_names:
+        return bare + '.Value'
+    return bare or 'any'
+
+
+def _teal_callback_signature(signature, names, enum_names, param_names=None, return_names=None):
+    param_names = param_names or names
+    return_names = return_names or names
+    m = re.match(r'^(.*?)\s*\((.*)\)$', signature.strip())
+    params = [p for p in _split_types_raw(m.group(2)) if p.strip() not in ('', 'void')]
+    typed = [(f'a{i + 1}', _teal_type(p, param_names, enum_names) or 'any') for i, p in enumerate(params)]
+    return typed, _teal_type(m.group(1), return_names, enum_names)
+
+
+def _teal_params(params, names, enum_names, type_names=None):
+    """(name, type, optional), split the same way as _lua_params."""
+    type_names = type_names or names
+    result = []
+    for i, param in enumerate(p for p in _split_types_raw(params) if p.strip()):
+        declaration, _, default = param.partition('=')
+        parts = declaration.strip().rsplit(' ', 1)
+        cpp_type, name = (parts[0], parts[1]) if len(parts) == 2 else (parts[0], '')
+        if 'lua_State' in cpp_type or cpp_type == '...':
+            result.append(('...', 'any', False))
+            continue
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+            name = f'p{i + 1}'
+        if name in TEAL_KEYWORDS:
+            name += '_'
+        result.append((name, _teal_type(cpp_type, type_names, enum_names) or 'any', bool(default.strip())))
+    return result
+
+
+def _teal_ident(name):
+    return bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name)) and name not in TEAL_KEYWORDS
+
+
+def _teal_enum(name, members, docs):
+    nested = 'Constant' if any(member.name == 'Value' for member in members) else 'Value'
+    lines = _teal_comment(docs.get(name, {}).get('description', ''))
+    lines.append(f'global record {name}')
+    lines.append(f'   record {nested}')
+    lines.append('   end')
+    for member in members:
+        lines.append(f'   {_teal_field(member.name)}: {name}.{nested}')
+    return lines + ['end', '']
+
+
+def _teal_constructor_signatures(name, cls, members, names, enum_names, type_names=None):
+    """(signature key, params) for every constructor, in binding order.
+
+    The key keeps the Teal parameter types and optional flags but not the
+    parameter names: overloads are compared by what a caller passes.
+    """
+    signatures = []
+    for s in members:
+        if s.kind != 'Constructor':
+            continue
+        open_paren = s.detail.find('(')
+        params = s.detail[open_paren + 1:-1] if open_paren >= 0 else ''
+        bound = [_param_type(p) for p in _split_types(params)]
+        header = next((c for c in constructors.get(cls.cpp_class or name, [])
+                       if [_param_type(p) for p in _split_types(c)] == bound), params)
+        parsed = _teal_params(header, names, enum_names, type_names)
+        signatures.append((tuple((typ, optional) for _, typ, optional in parsed), parsed))
+    return signatures
+
+
+def _teal_class(name, cls, members, doc, names, enum_names, cpp_methods, callbacks,
+                base='', inherited=(), parent_event_signature='', parent_ctors=()):
+    """One engine class as a global interface. Constructors are metamethod __call.
+
+    A class states its C++ base as `is <interface>`. The base is emitted first,
+    never after the derived interface: Teal resolves an `is` base at declaration
+    time. Teal accepts a derived interface's own __call when its result is the
+    derived type (a subtype of the base result), so constructors stay typed per
+    class instead of being flattened onto the base.
+
+    A member the base already declares is not repeated: Teal rejects a field
+    whose type differs from the base's, and the inherited declaration is the one
+    that matches the runtime object.
+
+    Constructors are different: Teal requires the derived __call to cover every
+    base constructor, so `parent_ctors` repeats them with this class as the
+    result. That keeps every base constructor discoverable (Object(scene) as
+    well as Object(scene, entity)); a derived type may show a base-only
+    constructor its Lua binding does not expose.
+    """
+    inherited = set(inherited)
+    member_docs = doc.get('members', {})
+    lines = _teal_comment(doc.get('description', ''))
+    if doc.get('url'):
+        lines.append(f'-- {doc["url"]}')
+    lines.append(f'global interface {name}' + (f' is {base}' if base else ''))
+
+    for s in members:
+        if s.kind not in ('Property', 'Constant', 'Event') or not s.name:
+            continue
+        if s.name in inherited:
+            continue
+        teal = _teal_type(_member_type(s.accessor, cpp_methods), names, enum_names) or 'any'
+        if s.kind == 'Event' and teal in callbacks:
+            teal += ' | ' + callbacks[teal]
+        notes = member_docs.get(s.name, '')
+        if s.readonly or s.kind == 'Constant':
+            notes = ('Read-only. ' + notes).strip()
+        elif s.detail.endswith('(copy)'):
+            notes = ('A copy: set the whole value to change it. ' + notes).strip()
+        lines += ['   ' + line for line in _teal_comment(notes)]
+        lines.append(f'   {_teal_field(s.name)}: {teal}')
+
+    for s in members:
+        if s.kind != 'Operator':
+            continue
+        op = LUA_OPERATORS[s.name]
+        meta = {'add': '__add', 'sub': '__sub', 'mul': '__mul', 'div': '__div', 'unm': '__unm'}[op]
+        if op == 'unm':
+            lines.append(f'   metamethod {meta}: function({name}): {name}')
+            continue
+        symbol = {'add': '+', 'sub': '-', 'mul': '*', 'div': '/'}[op]
+        for overload in s.overloads or [[]]:
+            operand = overload[0] if overload else ''
+            result = operator_returns.get(cls.cpp_class, {}).get((symbol, operand)) or name
+            operand_t = _teal_type(operand, names, enum_names) or 'any'
+            result_t = _teal_type(result, names, enum_names) or name
+            lines.append(f'   metamethod {meta}: function({name}, {operand_t}): {result_t}')
+
+    seen_ctors = set()
+    for key, params in _teal_constructor_signatures(name, cls, members, names, enum_names):
+        seen_ctors.add(key)
+        fun = _teal_fun([('self', name, False)] + params, name)
+        lines.append(f'   metamethod __call: {fun}')
+
+    # Repeat the base constructors: Teal checks that this interface accepts every
+    # call its base accepts. The result is the derived type, so this stays valid.
+    for key, params in parent_ctors:
+        if key in seen_ctors:
+            continue
+        seen_ctors.add(key)
+        fun = _teal_fun([('self', name, False)] + params, name)
+        lines.append(f'   metamethod __call: {fun}')
+
+    # An event subclass is also a constructor (Ease): keep one __call that
+    # matches the event base's result so the interface is compatible with it.
+    if parent_event_signature:
+        params, returns = _teal_callback_signature(parent_event_signature, names, enum_names)
+        call_params = [('self', name, False)] + [(param, typ, False) for param, typ in params]
+        lines.append(f'   metamethod __call: {_teal_fun(call_params, returns)}')
+
+    return lines
+
+
+def _teal_class_split(name, cls, members, doc, names, enum_names, cpp_methods, callbacks,
+                      base='', inherited=(), parent_event_signature='', parent_ctors=(),
+                      interface_name='', type_names=None, value_names=None, event_signature=''):
+    """Emit an interface for instance members and a concrete record for values.
+
+    Teal interfaces are abstract values, so static constants such as
+    Vector3.ZERO and the __call constructors must live on a concrete record.
+    The interface keeps inheritance, fields, methods and operators; the record
+    implements it and owns everything reached through the class name.
+    """
+    inherited = set(inherited)
+    type_names = type_names or names
+    value_names = value_names or names
+    interface_name = interface_name or name
+    member_docs = doc.get('members', {})
+
+    lines = _teal_comment(doc.get('description', ''))
+    if doc.get('url'):
+        lines.append(f'-- {doc["url"]}')
+    lines.append(f'global interface {interface_name}' + (f' is {base}' if base else ''))
+
+    # Instance fields belong to the interface; constants move to the record.
+    for s in members:
+        if s.kind not in ('Property', 'Event') or not s.name:
+            continue
+        if s.name in inherited:
+            continue
+        teal = _teal_type(_member_type(s.accessor, cpp_methods), value_names, enum_names) or 'any'
+        if s.kind == 'Event' and teal in callbacks:
+            teal += ' | ' + callbacks[teal]
+        notes = member_docs.get(s.name, '')
+        if s.readonly:
+            notes = ('Read-only. ' + notes).strip()
+        elif s.detail.endswith('(copy)'):
+            notes = ('A copy: set the whole value to change it. ' + notes).strip()
+        lines += ['   ' + line for line in _teal_comment(notes)]
+        lines.append(f'   {_teal_field(s.name)}: {teal}')
+
+    for s in members:
+        if s.kind != 'Operator':
+            continue
+        op = LUA_OPERATORS[s.name]
+        meta = {'add': '__add', 'sub': '__sub', 'mul': '__mul', 'div': '__div', 'unm': '__unm'}[op]
+        if op == 'unm':
+            lines.append(f'   metamethod {meta}: function({interface_name}): {name}')
+            continue
+        symbol = {'add': '+', 'sub': '-', 'mul': '*', 'div': '/'}[op]
+        for overload in s.overloads or [[]]:
+            operand = overload[0] if overload else ''
+            result = operator_returns.get(cls.cpp_class, {}).get((symbol, operand)) or name
+            operand_t = _teal_type(operand, type_names, enum_names) or 'any'
+            result_t = _teal_type(result, value_names, enum_names) or name
+            lines.append(f'   metamethod {meta}: function({interface_name}, {operand_t}): {result_t}')
+
+    if parent_event_signature:
+        params, returns = _teal_callback_signature(parent_event_signature, names, enum_names, type_names, value_names)
+        call_params = [('self', interface_name, False)] + [(param, typ, False) for param, typ in params]
+        lines.append(f'   metamethod __call: {_teal_fun(call_params, returns)}')
+
+    if event_signature:
+        lines += _teal_event_members(interface_name, event_signature, names, enum_names, type_names, value_names)
+
+    lines += _teal_methods(interface_name, members, doc, names, enum_names, cpp_methods,
+                           inherited=inherited, static_only=False,
+                           type_names=type_names, value_names=value_names)
+    lines += ['end', '']
+
+    # The record is the concrete value and namespace for static members.
+    lines.append(f'global record {name} is {interface_name}')
+    for s in members:
+        if s.kind != 'Constant' or not s.name:
+            continue
+        teal = _teal_type(_member_type(s.accessor, cpp_methods), value_names, enum_names) or 'any'
+        notes = member_docs.get(s.name, '')
+        if s.readonly:
+            notes = ('Read-only. ' + notes).strip()
+        lines += ['   ' + line for line in _teal_comment(notes)]
+        lines.append(f'   {_teal_field(s.name)}: {teal}')
+
+    lines += _teal_methods(name, members, doc, names, enum_names, cpp_methods,
+                           inherited=inherited, static_only=True,
+                           type_names=type_names, value_names=value_names)
+
+    seen_ctors = set()
+    for key, params in _teal_constructor_signatures(name, cls, members, names, enum_names, type_names):
+        seen_ctors.add(key)
+        lines.append(f'   metamethod __call: {_teal_fun([("self", name, False)] + params, name)}')
+
+    # A record does not inherit the base record's __call, so repeat the base
+    # constructors with the derived record as the result.
+    for key, params in parent_ctors:
+        if key in seen_ctors:
+            continue
+        seen_ctors.add(key)
+        lines.append(f'   metamethod __call: {_teal_fun([("self", name, False)] + params, name)}')
+
+    lines += ['end', '']
+    return lines
+
+
+def _teal_methods(name, members, doc, names, enum_names, cpp_methods, inherited=(),
+                  static_only=False, type_names=None, value_names=None):
+    inherited = set(inherited)
+    type_names = type_names or names
+    value_names = value_names or names
+    member_docs = doc.get('members', {})
+    lines = []
+    for s in members:
+        wanted = s.kind == 'StaticMethod' if static_only else s.kind == 'Method'
+        if not wanted or not s.name:
+            continue
+        if s.name in inherited:
+            continue
+        params, returns = s.lua_signature or ('...', '')
+        template = re.match(r'^get[A-Za-z]*<([A-Za-z0-9_:]+)>$', s.callee[1]) if s.callee else None
+        if template:
+            params, returns = '', template.group(1)
+        self_params = [] if s.kind == 'StaticMethod' else [('self', name, False)]
+        if params == '...':
+            signatures = [(self_params + [('...', 'any', False)], '')]
+        else:
+            signatures = [(self_params + _teal_params(params, names, enum_names, type_names),
+                           _teal_type(returns, value_names, enum_names))]
+            overloads = cpp_methods.get(s.callee[0], {}).get(s.callee[1], []) if s.callee else []
+            for bound in s.overloads:
+                other = _bound_overload(overloads, bound)
+                if other[0] != params:
+                    signatures.append((self_params + _teal_params(other[0], names, enum_names, type_names),
+                                       _teal_type(other[1] or returns, value_names, enum_names)))
+        lines += ['   ' + line for line in _teal_comment(member_docs.get(s.name, ''))]
+        for fun_params, fun_returns in signatures:
+            lines.append(f'   {_teal_field(s.name)}: {_teal_fun(fun_params, fun_returns)}')
+    return lines
+
+
+def _teal_event_members(name, signature, names, enum_names, type_names=None, value_names=None):
+    """An event can be called as a function. add registers another callback."""
+    type_names = type_names or names
+    value_names = value_names or names
+    params, returns = _teal_callback_signature(signature, names, enum_names, type_names, value_names)
+    call_params = [('self', name, False)] + [(param, typ, False) for param, typ in params]
+    func = _teal_fun([(param, typ, False) for param, typ in params], returns)
+    return [
+        f'   metamethod __call: {_teal_fun(call_params, returns)}',
+        '   -- Calls func each time the event is called, under a tag',
+        f'   add: {_teal_fun([("self", name, False), ("tag", "string", False), ("func", func, False)], "boolean")}',
+        f'   call: {_teal_fun(call_params, returns)}',
+    ]
+
+
+def generate_teal_declarations(symbols, events, cpp_methods, docs, output_path):
+    """Write a .d.tl in the teal-types global-environment form."""
+    symbols = _unique_symbols(symbols)
+    classes = {s.name: s for s in symbols if s.kind == 'Class' and _teal_ident(s.name)}
+    enums = {}
+    members = {}
+    for s in symbols:
+        if s.kind == 'EnumMember' and s.parent not in classes and _teal_ident(s.parent):
+            enums.setdefault(s.parent, []).append(s)
+        elif s.parent in classes and s.kind not in ('Class', 'CppMethod', 'EnumMember'):
+            members.setdefault(s.parent, []).append(s)
+    enum_names = set(enums)
+    names = {name: name for name in classes}
+    names.update({cls.cpp_class: name for name, cls in classes.items() if cls.cpp_class})
+    names.update({name: name for name in enums})
+    names.update({_type_key(f'FunctionSubscribe<{signature}>'): name for signature, name in events.items()})
+    callbacks = {}
+    for signature, event_name in events.items():
+        params, returns = _teal_callback_signature(signature, names, enum_names)
+        callbacks[event_name] = _teal_fun([(param, typ, False) for param, typ in params], returns)
+    event_signatures = {event_name: signature for signature, event_name in events.items()}
+
+    # Public class names stay concrete records so static members and __call
+    # constructors are usable as values. Each class also gets an interface for
+    # polymorphism and inheritance.
+    interface_names = {}
+    reserved_names = set(classes) | set(enums) | set(event_signatures)
+    event_class_names = {
+        name for name, cls in classes.items()
+        if name in event_signatures or names.get(_type_key(cls.base), '') in event_signatures
+    }
+    for name in sorted(classes):
+        # Event classes such as Ease are already interface-shaped and use the
+        # event __call contract; keep them as interfaces instead of records.
+        if name in event_class_names:
+            interface_names[name] = name
+            continue
+        candidate = 'I' + name
+        while not _teal_ident(candidate) or candidate in reserved_names:
+            candidate += '_'
+        interface_names[name] = candidate
+        reserved_names.add(candidate)
+    interface_to_class = {interface: name for name, interface in interface_names.items()}
+    type_names = dict(interface_names)
+    type_names.update({name: name for name in enums})
+    type_names.update({name: name for name in event_signatures})
+    type_names.update({cls.cpp_class: interface_names[name]
+                       for name, cls in classes.items() if cls.cpp_class})
+    value_names = {name: name for name in classes}
+    value_names.update({name: name for name in enums})
+    value_names.update({name: name for name in event_signatures})
+    value_names.update({cls.cpp_class: name
+                        for name, cls in classes.items() if cls.cpp_class})
+
+    callbacks = {}
+    for signature, event_name in events.items():
+        params, returns = _teal_callback_signature(signature, names, enum_names, type_names, value_names)
+        callbacks[event_name] = _teal_fun([(param, typ, False) for param, typ in params], returns)
+
+    lines = list(TEAL_PRELUDE)
+    for name in sorted(enums):
+        if name in classes:
+            continue
+        lines += _teal_enum(name, enums[name], docs)
+    # The binding parser never sees beginClass for FunctionSubscribe<...>, so event classes are emitted here.
+    for event_name in sorted(event_signatures):
+        if event_name in classes or not _teal_ident(event_name):
+            continue
+        lines.append(f'global interface {event_name}')
+        lines += _teal_event_members(event_name, event_signatures[event_name], names, enum_names, type_names, value_names)
+        lines += ['end', '']
+    # A class states its C++ base. The base interface is emitted first: Teal
+    # resolves an `is` base when the derived interface is declared, not later.
+    available = set(classes) | set(event_signatures)
+    class_base = {}
+    for name, cls in classes.items():
+        base = names.get(_type_key(cls.base), '') if cls.base else ''
+        if base in available and base != name and _teal_ident(base):
+            class_base[name] = base
+
+    class_member_names = {}
+    for name in classes:
+        class_member_names[name] = {
+            s.name for s in members.get(name, [])
+            if s.name and s.kind in ('Property', 'Constant', 'Event', 'Method', 'StaticMethod')
+        }
+    event_member_names = {'add', 'call'}
+
+    def inherited_members(name):
+        # Names the base chain already declares; repeating one with another
+        # type is an error, and the inherited declaration matches the runtime.
+        found = set()
+        base = class_base.get(name, '')
+        seen = set()
+        while base and base not in seen:
+            seen.add(base)
+            if base in class_member_names:
+                found |= class_member_names[base]
+            elif base in event_signatures:
+                found |= event_member_names
+            base = class_base.get(base, '')
+        return found
+
+    ctor_sigs = {
+        name: _teal_constructor_signatures(name, classes[name], members.get(name, []), names, enum_names, type_names)
+        for name in classes
+    }
+
+    def ancestor_ctors(name):
+        # Teal requires a derived interface's __call to cover every constructor
+        # of its base, so a base constructor is repeated on each descendant with
+        # the descendant as its result. Keeping it on the base as well is what
+        # keeps Object(scene) and Object(scene, entity) both discoverable.
+        found = []
+        seen_keys = set()
+        base = class_base.get(name, '')
+        seen = set()
+        while base and base not in seen:
+            seen.add(base)
+            if base in classes:
+                for key, params in ctor_sigs.get(base, []):
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        found.append((key, params))
+            base = class_base.get(base, '')
+        return found
+
+    def ctor_type_deps(name):
+        # Teal resolves a `metamethod __call` while declaring the interface, so
+        # every class its parameter types name has to be declared first. The
+        # repeated base constructors count too, since they are emitted here.
+        deps = set()
+        signatures = ctor_sigs.get(name, []) + ancestor_ctors(name)
+        for key, params in signatures:
+            for _, typ, _ in params:
+                for ident in re.findall(r'[A-Za-z_][A-Za-z0-9_]*', typ):
+                    dependency = ident if ident in classes else interface_to_class.get(ident)
+                    if dependency and dependency != name:
+                        deps.add(dependency)
+        return deps
+
+    deps = {}
+    for name in classes:
+        found = set()
+        base = class_base.get(name, '')
+        if base in classes:
+            found.add(base)
+        found |= ctor_type_deps(name)
+        deps[name] = found
+
+    # An inheritance cycle, unlike a constructor forward reference, cannot be
+    # represented by Teal interfaces. Report it before emitting invalid d.tl.
+    for name in classes:
+        seen = set()
+        base = class_base.get(name, '')
+        while base:
+            if base in seen:
+                raise RuntimeError("Teal inheritance cycle while ordering " + name)
+            seen.add(base)
+            base = class_base.get(base, '')
+
+    class_order = []
+    placed = set()
+    visiting = set()
+    def place(name):
+        # Constructor parameter types may legitimately refer to another vector
+        # interface declared later (Vector2/Vector3/Vector4 constructors are
+        # mutually referential). Teal resolves those references lazily; only an
+        # `is` inheritance cycle would be invalid, and that is not represented
+        # by this traversal's visited marker. Keep the best-effort order.
+        if name in placed or name in visiting:
+            return
+        visiting.add(name)
+        for dependency in sorted(deps.get(name, ())):
+            place(dependency)
+        visiting.discard(name)
+        placed.add(name)
+        class_order.append(name)
+    for name in sorted(classes):
+        place(name)
+
+    for name in class_order:
+        doc = docs.get(name, {})
+        own = members.get(name, [])
+        if name in event_signatures:
+            own = [s for s in own if s.name not in ('add', 'call')]
+        base = class_base.get(name, '')
+        base_interface = interface_names.get(base, base)
+        inherited = inherited_members(name)
+        if name in event_class_names:
+            # Event subclasses cannot be records: their event __call and their
+            # constructor __call would conflict in a record that implements the
+            # event interface. Keep the existing interface form for them.
+            lines += _teal_class(name, classes[name], own, doc, names, enum_names, cpp_methods, callbacks,
+                                 base=base_interface, inherited=inherited,
+                                 parent_event_signature=event_signatures.get(base, ''),
+                                 parent_ctors=ancestor_ctors(name))
+            if name in event_signatures:
+                lines += _teal_event_members(name, event_signatures[name], names, enum_names)
+            lines += _teal_methods(name, own, doc, names, enum_names, cpp_methods, inherited=inherited)
+            lines += ['end', '']
+        else:
+            lines += _teal_class_split(
+                name, classes[name], own, doc, names, enum_names, cpp_methods, callbacks,
+                base=base_interface, inherited=inherited,
+                parent_event_signature=event_signatures.get(base, ''),
+                parent_ctors=ancestor_ctors(name),
+                interface_name=interface_names[name],
+                type_names=type_names,
+                value_names=value_names,
+                event_signature=event_signatures.get(name, ''))
+    lines += [
+        '-- A Lua script attached to an entity, as self in its methods',
+        'global interface LuaScript',
+        '   scene: Scene',
+        '   entity: integer',
+        'end',
+        '',
+    ]
+
+    lines += _teal_comment('Calls self:methodName on an engine event, such as "onUpdate"')
+    lines.append('global function RegisterEngineEvent(script: LuaScript, methodName: string, tag?: string)')
+    lines.append('end')
+    lines.append('')
+    lines += _teal_comment("Calls self:methodName when a component event fires, such as a button's onClick")
+    lines.append('global function RegisterEvent(script: LuaScript, event: any, methodName: string, tag?: string)')
+    lines.append('end')
+    lines.append('')
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(lines))
+    print(f'[generate_api_suggestions] Generated {output_path} ({len(classes)} classes, {len(enums)} enums)')
 
 
 # ── Doc comments in the engine headers copied next to the editor ──────────
@@ -1588,6 +2201,8 @@ def main():
         shutil.rmtree(overlay_dir, ignore_errors=True)
         generate_lua_stubs(all_symbols, parse_event_classes(binding_files), cpp_methods, docs,
                            os.path.join(overlay_dir, 'lua-api', 'doriax.lua'))
+        generate_teal_declarations(all_symbols, parse_event_classes(binding_files), cpp_methods, docs,
+                                   os.path.join(overlay_dir, 'lua-api', 'doriax.d.tl'))
         annotate_headers(all_symbols, cpp_methods, docs, engine_core_dir, overlay_dir)
 
 

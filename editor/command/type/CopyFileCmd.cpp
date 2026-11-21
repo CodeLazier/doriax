@@ -77,7 +77,12 @@ void editor::CopyFileCmd::remapPaths(const fs::path& from, const fs::path& to, b
     if (isDir || Util::isMaterialFile(extension)) project->remapMaterialFilePath(from, to);
     if (isDir || Util::isSceneFile(extension)) project->remapSceneFilePath(from, to);
     if (isDir || Util::isBundleFile(extension)) project->remapEntityBundleFilePath(from, to);
-    if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)) project->remapScriptFilePath(from, to);
+    // Teal scripts are referenced like Lua scripts, so a move retargets them too.
+    if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)
+#ifdef DORIAX_TEAL
+        || Util::isTealFile(extension)
+#endif
+    ) project->remapScriptFilePath(from, to, isDir);
     if (isDir || Util::isAssetFile(extension)) project->remapAssetFilePath(from, to);
     if (isDir || Util::isShaderFile(extension)) project->remapShaderFilePath(from, to);
     // open tabs follow the move

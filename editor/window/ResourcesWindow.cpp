@@ -20,6 +20,9 @@
 #include "resources/icons/source-icon_png.h"
 #include "resources/icons/header-icon_png.h"
 #include "resources/icons/lua-icon_png.h"
+#ifdef DORIAX_TEAL
+#include "resources/icons/teal-icon_png.h"
+#endif
 #include "resources/icons/logic-icon_png.h"
 #include "resources/icons/shader-icon_png.h"
 #include "resources/icons/audio-icon_png.h"
@@ -1323,7 +1326,12 @@ void editor::ResourcesWindow::renderFileListing(bool showDirectories){
 
                 ImGui::Separator();
 
+                // External editor is the default for scripts. This item opens the built-in editor instead.
+#ifdef DORIAX_TEAL
+                if (!file.isDirectory && ExternalEditor::isEnabled() && (Util::isScriptFile(file.name) || Util::isTealFile(file.name))){
+#else
                 if (!file.isDirectory && ExternalEditor::isEnabled() && Util::isScriptFile(file.name)){
+#endif
                     if (ImGui::MenuItem(ICON_FA_CODE " Open in Built-in Editor")){
                         codeEditor->openFile((currentPath / file.name).string(), true);
                     }
@@ -1652,6 +1660,9 @@ void editor::ResourcesWindow::scanDirectory(const fs::path& path) {
     TextureRender* sourceIconH = sourceIcon.getRender();
     TextureRender* headerIconH = headerIcon.getRender();
     TextureRender* luaIconH = luaIcon.getRender();
+#ifdef DORIAX_TEAL
+    TextureRender* tealIconH = tealIcon.getRender();
+#endif
     TextureRender* logicIconH = logicIcon.getRender();
     TextureRender* shaderIconH = shaderIcon.getRender();
     TextureRender* audioIconH = audioIcon.getRender();
@@ -1708,6 +1719,12 @@ void editor::ResourcesWindow::scanDirectory(const fs::path& path) {
                 fileEntry.icon = entityIconH;
             }else if (Util::isModelFile(fileEntry.extension)){
                 fileEntry.type = FileType::MODEL;
+#ifdef DORIAX_TEAL
+            }else if (Util::isTealFile(fileEntry.extension) || Util::isTealFile(fileEntry.name)){
+                //Use the Teal icon for .tl and .d.tl files. The declaration is not a script, but it is still Teal.
+                fileEntry.type = FileType::LUA;
+                fileEntry.icon = tealIconH;
+#endif
             }else if (Util::isLuaFile(fileEntry.extension)){
                 fileEntry.type = FileType::LUA;
                 fileEntry.icon = luaIconH;
@@ -1823,6 +1840,10 @@ void editor::ResourcesWindow::renderNewItemMenu(const fs::path& directory){
     bool inLuaDir = Util::isInsidePath(directory, project->getLuaPath());
     if (ImGui::MenuItem(ICON_FA_FILE_CODE " Lua Script", nullptr, false, inLuaDir)) startNewItem(NewItemType::LUA_SCRIPT, directory);
     if (!inLuaDir) ImGui::SetItemTooltip("Lua scripts must be inside the Lua directory");
+#ifdef DORIAX_TEAL
+    if (ImGui::MenuItem(ICON_FA_FILE_CODE " Teal Script", nullptr, false, inLuaDir)) startNewItem(NewItemType::TEAL_SCRIPT, directory);
+    if (!inLuaDir) ImGui::SetItemTooltip("Teal scripts must be inside the Lua directory");
+#endif
     if (ImGui::MenuItem(ICON_FA_DIAGRAM_PROJECT " Logic Graph", nullptr, false, inLuaDir)) startNewItem(NewItemType::LOGIC_GRAPH, directory);
     ImGui::SetItemTooltip(inLuaDir ? "A script made of nodes" : "Logic graphs must be inside the Lua directory");
 
@@ -1858,6 +1879,7 @@ void editor::ResourcesWindow::handleNewItem(){
     bool isFolder = (newItemType == NewItemType::FOLDER);
     const char* popupName = "Create New Directory";
     if (newItemType == NewItemType::LUA_SCRIPT) popupName = "Create New Lua Script";
+    else if (newItemType == NewItemType::TEAL_SCRIPT) popupName = "Create New Teal Script";
     else if (newItemType == NewItemType::CPP_SOURCE) popupName = "Create New C++ Source";
     else if (newItemType == NewItemType::CPP_HEADER) popupName = "Create New C++ Header";
     else if (newItemType == NewItemType::SHADER) popupName = "Create New Shader";
@@ -1911,6 +1933,40 @@ void editor::ResourcesWindow::handleNewItem(){
                     if (!Util::isLuaFile(itemName)) itemName += ".lua";
                     std::string moduleName = Factory::toIdentifier(fs::path(itemName).stem().string());
                     content = "local " + moduleName + " = {}\n\nreturn " + moduleName + "\n";
+                } else if (newItemType == NewItemType::TEAL_SCRIPT) {
+#ifdef DORIAX_TEAL
+                    if (!Util::isTealFile(itemName)) itemName += ".tl";
+                    // The record's name has to be an identifier, and Teal keywords cannot name one.
+                    std::string moduleName = Factory::toIdentifier(fs::path(itemName).stem().string());
+                    if (LogicNodes::isLuaKeyword(moduleName) || ProjectUtils::isTealKeyword(moduleName))
+                        moduleName += "Script";
+
+                    // The comment has to name the module the way require() sees it.
+                    // The Lua root is the require root, so a file in <lua>/scripts
+                    // is "scripts.<module>", not just "<module>".
+                    std::string requireName = moduleName;
+                    std::error_code relEc;
+                    fs::path luaRoot = project->getLuaPath();
+                    fs::path currentDir = newItemDirectory;
+                    if (currentDir.is_relative())
+                        currentDir = fs::absolute(currentDir, relEc);
+                    if (!relEc && luaRoot.is_relative())
+                        luaRoot = fs::absolute(luaRoot, relEc);
+                    if (!relEc) {
+                        const fs::path relativeDir = fs::relative(currentDir, luaRoot, relEc);
+                        if (!relEc && !relativeDir.empty() && !relativeDir.is_absolute() &&
+                            *relativeDir.begin() != "..") {
+                            std::string namespacePrefix;
+                            for (const fs::path& part : relativeDir) {
+                                if (part.empty() || part == ".")
+                                    continue;
+                                namespacePrefix += FileUtils::pathToUtf8(part) + ".";
+                            }
+                            requireName = namespacePrefix + moduleName;
+                        }
+                    }
+                    content = ProjectUtils::getTealModuleTemplate(moduleName, requireName);
+#endif
                 } else if (newItemType == NewItemType::CPP_SOURCE) {
                     if (!Util::isSourceFile(itemName)) itemName += ".cpp";
                 } else if (newItemType == NewItemType::CPP_HEADER) {
@@ -2707,6 +2763,12 @@ void editor::ResourcesWindow::show() {
         data.loadTextureFromMemory(lua_icon_png, lua_icon_png_len);
         luaIcon.setData("editor:resources:lua_icon", data);
         luaIcon.load();
+
+#ifdef DORIAX_TEAL
+        data.loadTextureFromMemory(teal_icon_png, teal_icon_png_len);
+        tealIcon.setData("editor:resources:teal_icon", data);
+        tealIcon.load();
+#endif
 
         data.loadTextureFromMemory(logic_icon_png, logic_icon_png_len);
         logicIcon.setData("editor:resources:logic_icon", data);

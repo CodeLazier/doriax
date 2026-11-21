@@ -1284,7 +1284,11 @@ std::string fileTypeFromPath(const fs::path& path) {
     if (Util::isImageFile(value)) return "image";
     if (Util::isMaterialFile(value)) return "material";
     if (Util::isSceneFile(value)) return "scene";
+#ifdef DORIAX_TEAL
+    if (Util::isScriptFile(value) || Util::isTealFile(value)) return "script";
+#else
     if (Util::isScriptFile(value)) return "script";
+#endif
     if (Util::isAudioFile(value)) return "audio";
     if (Util::isFontFile(value)) return "font";
     return "file";

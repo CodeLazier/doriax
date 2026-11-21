@@ -15,6 +15,7 @@
 #include "json.hpp"
 
 #include <cstdlib>
+#include <cstdio>
 #include <cctype>
 #include <stdexcept>
 #include <chrono>
@@ -504,8 +505,11 @@ std::string editor::Generator::getPlatformCMakeConfig(bool vsyncEnabled, const W
     // teammate who clones elsewhere still finds the assets
     content += "    add_definitions(\"-DDORIAX_ASSET_PATH=\\\"" + toProjectRootCMakePath(projectPath, assetsPath) + "\\\"\")\n";
     content += "    add_definitions(\"-DDORIAX_LUA_PATH=\\\"" + toProjectRootCMakePath(projectPath, luaPath) + "\\\"\")\n";
-    // where main.cpp finds the Lua written from logic graphs
+    // where main.cpp finds the Lua written from logic graphs and Teal
     content += "    add_definitions(\"-DDORIAX_LOGIC_PATH=\\\"${INTERNAL_DIR}/generated/logic\\\"\")\n";
+#ifdef DORIAX_TEAL
+    content += "    add_definitions(\"-DDORIAX_TEAL_PATH=\\\"${INTERNAL_DIR}/generated/teal\\\"\")\n";
+#endif
     content += "\n";
     content += "    # The compiled shader cache sits in this user's cache directory and is named\n";
     content += "    # after the engine version, so its path belongs to neither the project nor any\n";
@@ -1948,7 +1952,7 @@ bool editor::Generator::hasSceneSource(uint32_t sceneId, const std::string& scen
     return std::getline(file, header) && header == Factory::sceneSourceHeader;
 }
 
-void editor::Generator::configure(const std::vector<editor::SceneBuildInfo>& scenes, std::string libName, const std::vector<SceneScriptSource>& scriptFiles, const std::vector<editor::BundleSceneInfo>& bundles, const fs::path& projectPath, const fs::path& projectInternalPath, const fs::path& assetsPath, const fs::path& luaPath, const std::vector<fs::path>& scriptDirs, int cxxStandard, Scaling scalingMode, TextureStrategy textureStrategy, unsigned int canvasWidth, unsigned int canvasHeight, bool vsyncEnabled, const WindowSettings& windowSettings, const LoadingSettings& loadingSettings, const std::vector<std::string>& logicScripts){
+void editor::Generator::configure(const std::vector<editor::SceneBuildInfo>& scenes, std::string libName, const std::vector<SceneScriptSource>& scriptFiles, const std::vector<editor::BundleSceneInfo>& bundles, const fs::path& projectPath, const fs::path& projectInternalPath, const fs::path& assetsPath, const fs::path& luaPath, const std::vector<fs::path>& scriptDirs, int cxxStandard, Scaling scalingMode, TextureStrategy textureStrategy, unsigned int canvasWidth, unsigned int canvasHeight, bool vsyncEnabled, const WindowSettings& windowSettings, const LoadingSettings& loadingSettings, const std::vector<std::string>& logicScripts, const std::vector<std::string>& tealScripts){
     const fs::path generatedPath = getGeneratedPath(projectInternalPath);
     targetName = libName;
 
@@ -2157,18 +2161,61 @@ void editor::Generator::configure(const std::vector<editor::SceneBuildInfo>& sce
 
     mainContent += "\n";
 
-    // The Lua of a logic graph is not in the Lua directory, where an export puts it
-    if (!logicScripts.empty()) {
-        std::string names;
-        for (const std::string& script : logicScripts) {
-            names += (names.empty() ? "\"" : ", \"") + script + "\"";
-        }
+    // Logic graph and Teal Lua are not in the Lua directory, where an export puts them
+    if (!logicScripts.empty() || !tealScripts.empty()) {
+        auto quoteList = [](const std::vector<std::string>& scripts) {
+            // Escape a path for a C++ string literal in the generated main.cpp.
+            auto quoteOne = [](const std::string& value) {
+                std::string quoted = "\"";
+                for (unsigned char c : value) {
+                    if (c == '\\' || c == '"') {
+                        quoted.push_back('\\');
+                        quoted.push_back(static_cast<char>(c));
+                    } else if (c == '\n') {
+                        quoted += "\\n";
+                    } else if (c == '\r') {
+                        quoted += "\\r";
+                    } else if (c == '\t') {
+                        quoted += "\\t";
+                    } else if (c < 0x20 || c == 0x7f) {
+                        char escaped[8];
+                        // Three octal digits: a following hex digit cannot be absorbed.
+                        std::snprintf(escaped, sizeof(escaped), "\\%03o", c);
+                        quoted += escaped;
+                    } else {
+                        quoted.push_back(static_cast<char>(c));
+                    }
+                }
+                quoted.push_back('"');
+                return quoted;
+            };
+
+            std::string names;
+            for (const std::string& script : scripts) {
+                if (!names.empty()) names += ", ";
+                names += quoteOne(script);
+            }
+            return names;
+        };
         mainContent += "    // DORIAX_LOGIC_SCRIPTS_BEGIN\n";
-        mainContent += "#ifdef DORIAX_LOGIC_PATH\n";
+        mainContent += "#if defined(DORIAX_LOGIC_PATH) || defined(DORIAX_TEAL_PATH)\n";
+        if (!tealScripts.empty()) {
+            // The generated game links a prebuilt engine library, so it gets the
+            // compiled Teal directory through this runtime setter rather than a
+            // macro compiled into the engine.
+            mainContent += "        LuaBinding::setTealModulePath(DORIAX_TEAL_PATH);\n";
+        }
         mainContent += "    LuaBinding::setScriptPathResolver([](const std::string& path) {\n";
-        mainContent += "        for (const char* script : {" + names + "}) {\n";
-        mainContent += "            if (path == script) return std::string(DORIAX_LOGIC_PATH \"/\") + path;\n";
-        mainContent += "        }\n";
+        if (!logicScripts.empty()) {
+            mainContent += "        for (const char* script : {" + quoteList(logicScripts) + "}) {\n";
+            mainContent += "            if (path == script) return std::string(DORIAX_LOGIC_PATH \"/\") + path;\n";
+            mainContent += "        }\n";
+        }
+        if (!tealScripts.empty()) {
+            mainContent += "        for (const char* script : {" + quoteList(tealScripts) + "}) {\n";
+            mainContent += "            if (path == script) return std::string(DORIAX_TEAL_PATH \"/\") + path;\n";
+            mainContent += "        }\n";
+        }
         mainContent += "        return std::string();\n";
         mainContent += "    });\n";
         mainContent += "#endif\n";

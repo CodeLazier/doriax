@@ -22,6 +22,7 @@ private:
         CPP_SUBCLASS,
         CPP_SCRIPT_CLASS,
         LUA,
+        TEAL, // Written as .tl. The entity still stores a Lua script entry.
         LOGIC,
     };
 
@@ -48,6 +49,8 @@ private:
     fs::path makeHeaderPath(const std::string& className) const;
     fs::path makeSourcePath(const std::string& className) const;
     fs::path makeLuaPath(const std::string& moduleName) const;
+    // Lua, Teal and logic graphs share the Lua directory and a Lua script slot.
+    static bool isLuaFamily(CreationKind kind);
 
     void writeFiles(const fs::path& headerPath,
                     const fs::path& sourcePath,
@@ -69,13 +72,20 @@ public:
     ScriptCreateDialog() = default;
     ~ScriptCreateDialog() = default;
 
+    // Default opens on the C++ subclass template. Teal opens on the .tl template.
+    enum class InitialTemplate {
+        Default,
+        Teal,
+    };
+
     void open(Scene* scene,
               Entity entity,
               const fs::path& projectPath,
               const fs::path& luaPath,
               const std::string& defaultBaseName,
               std::function<void(const fs::path&, const fs::path&, const std::string&, ScriptType)> onCreate,
-              std::function<void()> onCancel = nullptr);
+              std::function<void()> onCancel = nullptr,
+              InitialTemplate initial = InitialTemplate::Default);
 
     void show();
     bool isOpen() const { return m_isOpen; }

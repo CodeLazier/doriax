@@ -96,6 +96,8 @@ unsigned int LuaBinding::luaStateGeneration = 0;
 
 // modules the engine itself loads, anything after this is project code
 static std::set<std::string> baselineLuaModules;
+// Compiled Teal modules, set by a generated project through setTealModulePath.
+static std::string tealModulePath;
 
 // require() reads this registry table, package.loaded is only an alias to it
 static void collectLoadedModuleNames(lua_State* L, std::set<std::string>& out){
@@ -399,6 +401,11 @@ int LuaBinding::setLuaPath(const char* path) {
     return 0;
 }
 
+// Stores the directory of compiled Teal modules for moduleLoader's fallback.
+void LuaBinding::setTealModulePath(const std::string& path) {
+    tealModulePath = path;
+}
+
 int LuaBinding::moduleLoader(lua_State *L) {
     
     const char *filename = lua_tostring(L, 1);
@@ -426,6 +433,22 @@ int LuaBinding::moduleLoader(lua_State *L) {
                         filepath.c_str());
         
         return 1;
+    }
+
+    // Generated projects keep compiled Teal modules outside the Lua directory.
+    // Try that tree only after the normal Lua lookup fails, and reject names
+    // that could escape it.
+    const std::string tealModule = filename ? filename : "";
+    if (!tealModulePath.empty() && tealModule.find("..") == std::string::npos &&
+        tealModule.find(':') == std::string::npos &&
+        (tealModule.empty() || (tealModule.front() != '/' && tealModule.front() != '\\'))) {
+        filepath = tealModulePath + separator + tealModule + ".lua";
+        filedata.open(filepath.c_str());
+        if (filedata.getMemPtr() != NULL) {
+            luaL_loadbuffer(L, (const char *) filedata.getMemPtr(), filedata.length(),
+                            filepath.c_str());
+            return 1;
+        }
     }
     
     lua_pushstring(L, "\n\tno file in assets directory");

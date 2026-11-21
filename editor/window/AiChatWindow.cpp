@@ -1811,9 +1811,12 @@ void AiChatWindow::collectMentionCandidates(std::vector<MentionItem>& out) const
                 continue;
             }
 
-            const std::string pathStr = path.string();
+            const std::string pathStr = FileUtils::pathToUtf8(path);
             const bool useful =
                 Util::isSceneFile(pathStr) || Util::isScriptFile(pathStr) ||
+#ifdef DORIAX_TEAL
+                Util::isTealFile(pathStr) ||
+#endif
                 Util::isLuaFile(pathStr) || Util::isImageFile(pathStr) ||
                 Util::isMaterialFile(pathStr) || Util::isModelFile(pathStr) ||
                 Util::isShaderFile(pathStr) || Util::isAudioFile(pathStr) ||

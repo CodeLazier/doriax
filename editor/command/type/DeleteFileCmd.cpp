@@ -42,7 +42,11 @@ bool editor::DeleteFileCmd::execute(){
         fs::create_directory(trash);
     }
 
-    std::vector<fs::path> deletedPaths;
+    struct DeletedPath {
+        fs::path path;
+        bool directory = false;
+    };
+    std::vector<DeletedPath> deletedPaths;
     bool deletedShaderSource = false;
 
     for (DeleteFilesData& file : files){
@@ -68,7 +72,7 @@ bool editor::DeleteFileCmd::execute(){
                     fs::rename(file.originalFile, file.trashFile);
                 }
 
-                deletedPaths.push_back(file.originalFile);
+                deletedPaths.push_back({file.originalFile, isDirectory});
             }
         } catch (const fs::filesystem_error& e) {
             printf("Error: Deleting %s: %s\n", file.originalFile.string().c_str(), e.what());
@@ -78,12 +82,12 @@ bool editor::DeleteFileCmd::execute(){
 
     if (project) {
         for (const auto& deletedPath : deletedPaths) {
-            project->cleanupMaterialFilePath(deletedPath);
-            project->cleanupSceneFilePath(deletedPath);
-            project->cleanupEntityBundleFilePath(deletedPath);
-            project->cleanupScriptFilePath(deletedPath);
-            project->cleanupAssetFilePath(deletedPath);
-            project->cleanupShaderFilePath(deletedPath);
+            project->cleanupMaterialFilePath(deletedPath.path);
+            project->cleanupSceneFilePath(deletedPath.path);
+            project->cleanupEntityBundleFilePath(deletedPath.path);
+            project->cleanupScriptFilePath(deletedPath.path, deletedPath.directory);
+            project->cleanupAssetFilePath(deletedPath.path);
+            project->cleanupShaderFilePath(deletedPath.path);
         }
         if (deletedShaderSource)
             project->invalidateCustomShaders();

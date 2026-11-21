@@ -107,6 +107,7 @@ namespace doriax::editor {
         Texture sourceIcon;
         Texture headerIcon;
         Texture luaIcon;
+        Texture tealIcon;
         Texture logicIcon;
         Texture shaderIcon;
         Texture audioIcon;
@@ -147,6 +148,7 @@ namespace doriax::editor {
         enum class NewItemType {
             FOLDER,
             LUA_SCRIPT,
+            TEAL_SCRIPT,
             CPP_SOURCE,
             CPP_HEADER,
             SHADER,

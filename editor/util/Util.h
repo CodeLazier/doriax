@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -52,7 +53,7 @@ namespace doriax::editor{
         }
 
         inline static std::string getScriptExtensions() {
-             return "lua,logic,cpp,cc,cxx,h,hh,hpp,hxx";
+             return "lua,tl,logic,cpp,cc,cxx,h,hh,hpp,hxx";
         }
 
         inline static bool isImageFile(const std::string& path) {
@@ -130,12 +131,27 @@ namespace doriax::editor{
         }
 
         inline static bool isLogicGraphFile(const std::string& path) {
-            std::string ext = std::filesystem::path(path).extension().string();
-            if (ext.empty() && !path.empty() && path[0] == '.') {
-                ext = path;
-            }
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            return ext == ".logic";
+            return fileExtensionLower(path) == ".logic";
+        }
+
+        inline static bool isTealFile(const std::string& path) {
+            // Keep this string-based: callers pass UTF-8 paths, and constructing a
+            // std::filesystem::path from a narrow UTF-8 string is lossy on Windows.
+            std::string name = path;
+            std::replace(name.begin(), name.end(), '\\', '/');
+            const size_t slash = name.find_last_of('/');
+            if (slash != std::string::npos)
+                name = name.substr(slash + 1);
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+            if (name.size() < 3 || name.compare(name.size() - 3, 3, ".tl") != 0)
+                return false;
+            // An extension-only argument asks "is this Teal?", not about one file.
+            if (name == ".tl")
+                return true;
+            // foo.d.tl is a type declaration. Compile and export do not treat it as a script.
+            return name.size() < 5 || name.compare(name.size() - 5, 5, ".d.tl") != 0;
         }
 
         inline static bool isGraphFile(const std::string& path) {
@@ -247,17 +263,31 @@ namespace doriax::editor{
             return isImageFile(path) || isModelFile(path) || isFontFile(path) || isAudioFile(path);
         }
 
+        // Extension of a path passed as UTF-8 text. Do not build a
+        // std::filesystem::path here: on Windows its narrow constructor uses the
+        // ANSI code page, which is lossy for non-ASCII project paths.
+        inline static std::string fileExtensionLower(const std::string& path) {
+            std::string name = path;
+            std::replace(name.begin(), name.end(), '\\', '/');
+            const size_t slash = name.find_last_of('/');
+            if (slash != std::string::npos)
+                name = name.substr(slash + 1);
+
+            size_t dot = name.rfind('.');
+            std::string ext = (dot == std::string::npos) ? "" : name.substr(dot);
+            if (ext.empty() && !name.empty() && name[0] == '.')
+                ext = name;
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return ext;
+        }
+
         inline static bool isScriptFile(const std::string& path) {
              static const std::unordered_set<std::string> scriptExtensions = {
                 ".lua", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"
             };
 
-            std::string ext = std::filesystem::path(path).extension().string();
-            if (ext.empty() && !path.empty() && path[0] == '.') {
-                ext = path;
-            }
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            return scriptExtensions.find(ext) != scriptExtensions.end();
+            return scriptExtensions.find(fileExtensionLower(path)) != scriptExtensions.end();
         }
 
         inline static bool isLuaFile(const std::string& path) {
@@ -265,12 +295,7 @@ namespace doriax::editor{
                 ".lua"
             };
 
-            std::string ext = std::filesystem::path(path).extension().string();
-            if (ext.empty() && !path.empty() && path[0] == '.') {
-                ext = path;
-            }
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            return luaExtensions.find(ext) != luaExtensions.end();
+            return luaExtensions.find(fileExtensionLower(path)) != luaExtensions.end();
         }
 
         inline static bool isHeaderFile(const std::string& path) {
@@ -278,12 +303,7 @@ namespace doriax::editor{
                 ".h", ".hh", ".hpp", ".hxx"
             };
 
-            std::string ext = std::filesystem::path(path).extension().string();
-            if (ext.empty() && !path.empty() && path[0] == '.') {
-                ext = path;
-            }
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            return headerExtensions.find(ext) != headerExtensions.end();
+            return headerExtensions.find(fileExtensionLower(path)) != headerExtensions.end();
         }
 
         inline static bool isSourceFile(const std::string& path) {
@@ -291,12 +311,7 @@ namespace doriax::editor{
                 ".cpp", ".cc", ".cxx"
             };
 
-            std::string ext = std::filesystem::path(path).extension().string();
-            if (ext.empty() && !path.empty() && path[0] == '.') {
-                ext = path;
-            }
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            return sourceExtensions.find(ext) != sourceExtensions.end();
+            return sourceExtensions.find(fileExtensionLower(path)) != sourceExtensions.end();
         }
 
         // String-list drag payloads ("external_files", "resource_files") are

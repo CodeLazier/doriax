@@ -55,8 +55,13 @@ bool editor::RenameFileCmd::execute(){
                 if (isDir || Util::isBundleFile(extension)) {
                     project->remapEntityBundleFilePath(sourceFs, destFs);
                 }
-                if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)) {
-                    project->remapScriptFilePath(sourceFs, destFs);
+                // Teal scripts are referenced like Lua scripts, so a rename retargets them too.
+                if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)
+#ifdef DORIAX_TEAL
+                    || Util::isTealFile(extension)
+#endif
+                ) {
+                    project->remapScriptFilePath(sourceFs, destFs, isDir);
                 }
                 if (isDir || Util::isAssetFile(extension)) {
                     project->remapAssetFilePath(sourceFs, destFs);
@@ -97,8 +102,13 @@ void editor::RenameFileCmd::undo(){
                 if (isDir || Util::isBundleFile(extension)) {
                     project->remapEntityBundleFilePath(sourceFs, destFs);
                 }
-                if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)) {
-                    project->remapScriptFilePath(sourceFs, destFs);
+                // Teal scripts are referenced like Lua scripts, so a rename retargets them too.
+                if (isDir || Util::isScriptFile(extension) || Util::isLogicGraphFile(extension)
+#ifdef DORIAX_TEAL
+                    || Util::isTealFile(extension)
+#endif
+                ) {
+                    project->remapScriptFilePath(sourceFs, destFs, isDir);
                 }
                 if (isDir || Util::isAssetFile(extension)) {
                     project->remapAssetFilePath(sourceFs, destFs);

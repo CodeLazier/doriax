@@ -39,6 +39,10 @@ endif()
 
 message(STATUS "Doriax version is ${DORIAXEDITOR_VERSION}")
 
+# Teal scripting support is optional so a build can omit the compiler, the
+# editor integration and the Teal UI entries entirely.
+option(DORIAX_ENABLE_TEAL "Enable Teal scripting support" ON)
+
 if(APPLE)
     enable_language(OBJCXX)
 endif()
@@ -407,11 +411,11 @@ file(GLOB BINDING_FILES CONFIGURE_DEPENDS "${BINDING_DIR}/*.cpp")
 file(GLOB_RECURSE ENGINE_HEADERS CONFIGURE_DEPENDS "${ENGINE_CORE_DIR}/*.h")
 
 add_custom_command(
-    OUTPUT ${API_SUGGESTIONS_HEADER} ${ENGINE_OVERLAY_DIR}/lua-api/doriax.lua
+    OUTPUT ${API_SUGGESTIONS_HEADER} ${ENGINE_OVERLAY_DIR}/lua-api/doriax.lua ${ENGINE_OVERLAY_DIR}/lua-api/doriax.d.tl
     COMMAND ${Python3_EXECUTABLE} ${GENERATE_API_SCRIPT}
             ${BINDING_DIR} ${API_SUGGESTIONS_HEADER} ${ENGINE_CORE_DIR} ${ENGINE_OVERLAY_DIR} ${API_DOCS_FILE}
     DEPENDS ${GENERATE_API_SCRIPT} ${BINDING_FILES} ${ENGINE_HEADERS} ${API_DOCS_FILE}
-    COMMENT "Generating engine_api_suggestions.h, Lua stubs and documented headers"
+    COMMENT "Generating engine_api_suggestions.h, Lua stubs, Teal declarations and documented headers"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
@@ -471,6 +475,12 @@ include_directories (${SHADERCOMPILER_ROOT}/src)
 
 add_subdirectory(${DORIAX_ROOT})
 
+if(MSVC AND TARGET doriax)
+    # Source files are UTF-8 without a BOM. Without this, MSVC reads them as
+    # code page 936 and emits C4819 for every non-ASCII comment or literal.
+    target_compile_options(doriax PRIVATE /utf-8)
+endif()
+
 # Signed alongside the exes, so it needs the same metadata. MinGW prefixes the name.
 if(WIN32 AND DORIAX_SHARED)
     doriax_add_windows_resource(
@@ -490,6 +500,10 @@ if(GRAPHIC_BACKEND STREQUAL "vulkan")
 endif()
 
 add_subdirectory(${SHADERCOMPILER_ROOT} EXCLUDE_FROM_ALL)
+
+if(MSVC AND TARGET shadercompiler)
+    target_compile_options(shadercompiler PRIVATE /utf-8)
+endif()
 
 add_subdirectory(libs/nfd)
 add_subdirectory(libs/yaml-cpp)
@@ -533,7 +547,13 @@ set_property(
 include_directories (${EDITOR_DIR})
 
 add_custom_target(generate_shaders DEPENDS ${SHADERS_HEADER})
-add_custom_target(generate_api_suggestions DEPENDS ${API_SUGGESTIONS_HEADER} ${ENGINE_OVERLAY_DIR}/lua-api/doriax.lua)
+add_custom_target(generate_api_suggestions DEPENDS ${API_SUGGESTIONS_HEADER} ${ENGINE_OVERLAY_DIR}/lua-api/doriax.lua ${ENGINE_OVERLAY_DIR}/lua-api/doriax.d.tl)
+
+if(DORIAX_ENABLE_TEAL)
+    set(DORIAX_TEAL_COMPILER_SOURCE ${EDITOR_DIR}/util/TealCompiler.cpp)
+else()
+    set(DORIAX_TEAL_COMPILER_SOURCE ${EDITOR_DIR}/util/TealCompilerStub.cpp)
+endif()
 
 set(DORIAX_EDITOR_SOURCES
     ${EDITOR_DIR}/main.cpp
@@ -579,6 +599,7 @@ set(DORIAX_EDITOR_SOURCES
     ${EDITOR_DIR}/util/ProjectLock.cpp
     ${EDITOR_DIR}/util/ProjectUtils.cpp
     ${EDITOR_DIR}/util/ScriptParser.cpp
+    ${DORIAX_TEAL_COMPILER_SOURCE}
     ${EDITOR_DIR}/util/ScriptEvents.cpp
     ${EDITOR_DIR}/util/PngWriter.cpp
     ${EDITOR_DIR}/util/FbxImporter.cpp
@@ -730,6 +751,16 @@ function(configure_doriax_editor_target target_name)
         yaml-cpp
         ufbx
     )
+
+    if(DORIAX_ENABLE_TEAL)
+        target_compile_definitions(${target_name} PRIVATE DORIAX_TEAL=1)
+    endif()
+
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /utf-8)
+        # TealCompiler.cpp includes Project.h, and that translation unit exceeds the COFF section limit.
+        target_compile_options(${target_name} PRIVATE /bigobj)
+    endif()
 
     if(WIN32)
         # dbghelp resolves the crash-report backtrace; ws2_32 serves MCP.

@@ -83,8 +83,21 @@ void SemanticSuggestions::AddSymbol(const std::string& name, SuggestionKind kind
     if (!namespaceName.empty()) namespaces.insert(namespaceName);
 }
 
+// Stores a constructor signature for parameter hints. Constructors are not
+// normal completion entries; the class name already provides that.
+void SemanticSuggestions::AddSignatureSymbol(const std::string& name, const std::string& detail, const std::string& parentType) {
+    SuggestionItem item;
+    item.label = name;
+    item.insertText = name;
+    item.detail = detail;
+    item.parentType = parentType;
+    item.kind = SuggestionKind::Function;
+    signatureSymbols.push_back(item);
+}
+
 void SemanticSuggestions::ClearSymbols() {
     symbols.clear();
+    signatureSymbols.clear();
     namespaces.clear();
 }
 
@@ -139,20 +152,26 @@ bool SemanticSuggestions::IsKnownNamespace(const std::string& name) const {
 
 std::vector<std::string> SemanticSuggestions::FindSignatures(const std::string& functionName, const std::string& parentType) const {
     std::vector<std::string> results;
-    for (const auto& symbol : symbols) {
-        if (symbol.label != functionName) continue;
-        if (symbol.kind != SuggestionKind::Method && symbol.kind != SuggestionKind::Function) continue;
-        // If parentType specified, match it (including ancestors)
-        if (!parentType.empty() && !symbol.parentType.empty()) {
-            if (!isTypeOrAncestor(parentType, symbol.parentType)) continue;
+
+    auto addFrom = [&](const std::vector<SuggestionItem>& list) {
+        for (const auto& symbol : list) {
+            if (symbol.label != functionName) continue;
+            if (symbol.kind != SuggestionKind::Method && symbol.kind != SuggestionKind::Function) continue;
+            // If parentType specified, match it (including ancestors)
+            if (!parentType.empty() && !symbol.parentType.empty()) {
+                if (!isTypeOrAncestor(parentType, symbol.parentType)) continue;
+            }
+            // Only real signatures (must contain a parameter list), no duplicates —
+            // generic details like "project function" are not overloads
+            if (symbol.detail.empty() || symbol.detail.find('(') == std::string::npos) continue;
+            if (std::find(results.begin(), results.end(), symbol.detail) == results.end()) {
+                results.push_back(symbol.detail);
+            }
         }
-        // Only real signatures (must contain a parameter list), no duplicates —
-        // generic details like "project function" are not overloads
-        if (symbol.detail.empty() || symbol.detail.find('(') == std::string::npos) continue;
-        if (std::find(results.begin(), results.end(), symbol.detail) == results.end()) {
-            results.push_back(symbol.detail);
-        }
-    }
+    };
+
+    addFrom(symbols);
+    addFrom(signatureSymbols);
     return results;
 }
 
@@ -165,7 +184,20 @@ std::vector<SuggestionItem> SemanticSuggestions::GetSuggestions(const Suggestion
 
     // Don't suggest if query is too short (unless after member access or explicit Ctrl+Space)
     if (query.length() < static_cast<size_t>(minPrefixLength) &&
-        !isMemberAccess && !context.manualInvoke) {
+        !isMemberAccess && !context.afterTypeColon && !context.manualInvoke) {
+        return results;
+    }
+
+    // A Teal type annotation names a type, not a member: list built-in types and
+    // user-defined record/interface names only.
+    if (context.afterTypeColon) {
+        addCandidates(results, types, SuggestionKind::Type, query);
+        // User-defined Teal records/interfaces are classes, not part of languageDef.types.
+        for (const auto& symbol : symbols) {
+            if (symbol.kind == SuggestionKind::Class || symbol.kind == SuggestionKind::Enum) {
+                addCandidates(results, {symbol.label}, SuggestionKind::Type, query);
+            }
+        }
         return results;
     }
 
