@@ -637,6 +637,14 @@ void editor::Properties::drawScenePropertyRow(SceneProject* sceneProject, const 
                     value = static_cast<ShadowQuality>(currentItem);
                 }
             }
+            if constexpr (std::is_same_v<T, ToneMapping>) {
+                const char* curveNames[] = { "None", "Reinhard", "ACES", "AgX" };
+                int currentItem = static_cast<int>(value);
+                changed = ImGui::Combo(("##" + propertyName).c_str(), &currentItem, curveNames, IM_ARRAYSIZE(curveNames));
+                if (changed) {
+                    value = static_cast<ToneMapping>(currentItem);
+                }
+            }
             if constexpr (std::is_same_v<T, TextureFilter>) {
                 const char* filterNames[] = { "Nearest", "Linear" };
                 int currentItem = (value == TextureFilter::LINEAR) ? 1 : 0;
@@ -3359,7 +3367,7 @@ bool editor::Properties::propertyRow(RowPropertyType type, ComponentType cpType,
             ImGui::PopStyleColor();
         //ImGui::SetItemTooltip("%s", prop.label.c_str());
 
-    }else if (type == RowPropertyType::Color3L){
+    }else if (type == RowPropertyType::Color3L || type == RowPropertyType::Color3LHDR){
         Vector3* value = nullptr;
         std::map<Entity, Vector3> eValue;
         bool dif = false;
@@ -3392,7 +3400,8 @@ bool editor::Properties::propertyRow(RowPropertyType type, ComponentType cpType,
 
         if (dif)
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-        if (ImGui::ColorEdit3((label+"##checkbox_"+id).c_str(), (float*)&newValue.x, UIUtils::colorSwatchFlags)){
+        const ImGuiColorEditFlags colorFlags = (type == RowPropertyType::Color3LHDR) ? UIUtils::colorSwatchFlagsHDR : UIUtils::colorSwatchFlags;
+        if (ImGui::ColorEdit3((label+"##checkbox_"+id).c_str(), (float*)&newValue.x, colorFlags)){
             for (Entity& entity : entities){
                 cmd = new PropertyCmd<Vector3>(project, sceneProject->id, entity, cpType, id, Color::sRGBToLinear(newValue), settings.onValueChanged);
                 CommandHandle::get(project->getSelectedSceneId())->addCommand(cmd);
@@ -6349,7 +6358,7 @@ void editor::Properties::drawMeshComponent(ComponentType cpType, SceneProject* s
             propertyRow(RowPropertyType::Float_0_1, cpType, "submeshes["+std::to_string(s)+"].material.metallicFactor", "Metallic Factor", sceneProject, entities, settingsFactor);
             propertyRow(RowPropertyType::Float_0_1, cpType, "submeshes["+std::to_string(s)+"].material.roughnessFactor", "Roughness Factor", sceneProject, entities, settingsFactor);
             propertyRow(RowPropertyType::Texture, cpType, "submeshes["+std::to_string(s)+"].material.metallicRoughnessTexture", "Met. Roug. Texture", sceneProject, entities, settingsMaterial);
-            propertyRow(RowPropertyType::Color3L, cpType, "submeshes["+std::to_string(s)+"].material.emissiveFactor", "Emissive Factor", sceneProject, entities, settingsMaterial);
+            propertyRow(RowPropertyType::Color3LHDR, cpType, "submeshes["+std::to_string(s)+"].material.emissiveFactor", "Emissive Factor", sceneProject, entities, settingsMaterial);
             propertyRow(RowPropertyType::Texture, cpType, "submeshes["+std::to_string(s)+"].material.emissiveTexture", "Emissive Texture", sceneProject, entities, settingsMaterial);
             propertyRow(RowPropertyType::Texture, cpType, "submeshes["+std::to_string(s)+"].material.occlusionTexture", "Occlusion Texture", sceneProject, entities, settingsMaterial);
             propertyRow(RowPropertyType::Texture, cpType, "submeshes["+std::to_string(s)+"].material.normalTexture", "Normal Texture", sceneProject, entities, settingsMaterial);
@@ -14659,6 +14668,45 @@ void editor::Properties::show(){
             // Ordered fullscreen passes run after the scene color (and SSR) pass; each one
             // is a shader file whose parameters become rows here.
             if (sceneProject->sceneType != SceneType::SCENE_UI) {
+                ImGui::SeparatorText("Bloom");
+
+                if (ImGui::BeginTable("scene_bloom_settings_table", 2, tableFlags)) {
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Threshold"));
+                    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+                    drawScenePropertyRow<bool>(sceneProject, "bloom_enabled", "Enabled", ScenePropertyInputType::Checkbox, -1.0f, 0.0f, 1.0f,
+                        "A glow around the bright parts of the image, added before the post-process passes.");
+
+                    if (doriax::editor::Catalog::getSceneProperty<bool>(sceneProject->scene, "bloom_enabled")) {
+                        drawScenePropertyRow<float>(sceneProject, "bloom_threshold", "Threshold", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 2.0f,
+                            "Brightness where the glow starts, linear: 1 is white.");
+                        drawScenePropertyRow<float>(sceneProject, "bloom_knee", "Knee", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 1.0f,
+                            "Soft start below the threshold, as a share of it. 0 cuts hard.");
+                        drawScenePropertyRow<float>(sceneProject, "bloom_intensity", "Intensity", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 4.0f,
+                            "Strength of the glow.");
+                        drawScenePropertyRow<float>(sceneProject, "bloom_radius", "Radius", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 1.0f,
+                            "0 keeps the glow close to the bright parts, 1 spreads it wide.");
+                    }
+
+                    ImGui::EndTable();
+                }
+
+                ImGui::SeparatorText("Tone Mapping");
+
+                if (ImGui::BeginTable("scene_tone_mapping_table", 2, tableFlags)) {
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Exposure"));
+                    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+                    drawScenePropertyRow<bool>(sceneProject, "hdr_enabled", "HDR", ScenePropertyInputType::Checkbox, -1.0f, 0.0f, 1.0f,
+                        "Keeps what is brighter than white until the curve, where devices can draw into float targets.");
+                    drawScenePropertyRow<float>(sceneProject, "exposure", "Exposure", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 4.0f,
+                        "Multiplies the scene brightness before the curve.");
+                    drawScenePropertyRow<ToneMapping>(sceneProject, "tone_mapping", "Curve", ScenePropertyInputType::Combo, 7 * ImGui::GetFontSize(), 0.0f, 1.0f,
+                        "How brightness maps to the screen. None clips at white.");
+
+                    ImGui::EndTable();
+                }
+
                 ImGui::SeparatorText("Post-processing");
                 drawScenePostProcess(sceneProject);
             }

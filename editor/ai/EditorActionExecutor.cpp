@@ -2188,6 +2188,14 @@ Json sceneReadableProperties(SceneProject* sceneProject) {
     props["ssr_blur"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "ssr_blur")}};
     props["ssr_max_steps"] = {{"type", "int"}, {"value", Catalog::getSceneProperty<int>(scene, "ssr_max_steps")}};
     props["ssr_debug_mode"] = {{"type", "int"}, {"value", Catalog::getSceneProperty<int>(scene, "ssr_debug_mode")}};
+    props["bloom_enabled"] = {{"type", "bool"}, {"value", Catalog::getSceneProperty<bool>(scene, "bloom_enabled")}};
+    props["bloom_threshold"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "bloom_threshold")}};
+    props["bloom_knee"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "bloom_knee")}};
+    props["bloom_intensity"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "bloom_intensity")}};
+    props["bloom_radius"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "bloom_radius")}};
+    props["hdr_enabled"] = {{"type", "bool"}, {"value", Catalog::getSceneProperty<bool>(scene, "hdr_enabled")}};
+    props["exposure"] = {{"type", "float"}, {"value", Catalog::getSceneProperty<float>(scene, "exposure")}};
+    props["tone_mapping"] = {{"type", "int"}, {"value", static_cast<int>(Catalog::getSceneProperty<ToneMapping>(scene, "tone_mapping"))}};
     props["fixed_resolution_enabled"] = {{"type", "bool"}, {"value", Catalog::getSceneProperty<bool>(scene, "fixed_resolution_enabled")}};
     props["fixed_resolution_width"] = {{"type", "int"}, {"value", Catalog::getSceneProperty<int>(scene, "fixed_resolution_width")}};
     props["fixed_resolution_height"] = {{"type", "int"}, {"value", Catalog::getSceneProperty<int>(scene, "fixed_resolution_height")}};
@@ -3570,7 +3578,7 @@ ActionResult EditorActionExecutor::setSceneProperty(const Json& arguments) {
         cmd = new ScenePropertyCmd<Vector3>(project, sceneId, property, value);
     } else if (property == "ssao_enabled" || property == "mesh_lod_enabled" || property == "depth_prepass_enabled" ||
                property == "ssao_half_resolution" || property == "ssao_debug" || property == "ssr_enabled" ||
-               property == "fixed_resolution_enabled") {
+               property == "fixed_resolution_enabled" || property == "bloom_enabled" || property == "hdr_enabled") {
         if (!arguments.contains("bool_value") || !arguments["bool_value"].is_boolean()) {
             return failResult(property + " requires bool_value.");
         }
@@ -3579,7 +3587,9 @@ ActionResult EditorActionExecutor::setSceneProperty(const Json& arguments) {
                property == "ssao_radius" || property == "mesh_lod_threshold" ||
                property == "ssao_intensity" || property == "ssao_bias" ||
                property == "ssr_max_distance" || property == "ssr_thickness" ||
-               property == "ssr_intensity" || property == "ssr_blur") {
+               property == "ssr_intensity" || property == "ssr_blur" ||
+               property == "bloom_threshold" || property == "bloom_knee" ||
+               property == "bloom_intensity" || property == "bloom_radius" || property == "exposure") {
         if (!arguments.contains("number_value") || !arguments["number_value"].is_number()) {
             return failResult(property + " requires number_value.");
         }
@@ -3606,6 +3616,15 @@ ActionResult EditorActionExecutor::setSceneProperty(const Json& arguments) {
         }
         cmd = new ScenePropertyCmd<LightState>(project, sceneId, property,
                                                static_cast<LightState>(arguments["int_value"].get<int>()));
+    } else if (property == "tone_mapping") {
+        if (!arguments.contains("int_value") || !arguments["int_value"].is_number_integer()) {
+            return failResult("tone_mapping requires int_value (0=none, 1=reinhard, 2=aces, 3=agx).");
+        }
+        const int curve = arguments["int_value"].get<int>();
+        if (curve < 0 || curve > 3) {
+            return failResult("tone_mapping must be 0 (none), 1 (reinhard), 2 (aces) or 3 (agx).");
+        }
+        cmd = new ScenePropertyCmd<ToneMapping>(project, sceneId, property, static_cast<ToneMapping>(curve));
     } else if (property == "shadows_quality" || property == "shadows_2d_quality") {
         if (!arguments.contains("int_value") || !arguments["int_value"].is_number_integer()) {
             return failResult(property + " requires int_value (0=none, 1=low, 2=medium, 3=high).");

@@ -21,6 +21,14 @@ namespace doriax{
         AUTO
     };
 
+    // curve from the scene brightness to the screen
+    enum class ToneMapping {
+        NONE,     // clips at white
+        REINHARD,
+        ACES,
+        AGX
+    };
+
     // PCF filter quality of shadow edges, uniform-driven (no shader rebuild).
     // 3D shadows (shadowQuality): NONE = 1 tap, LOW = 3x3, MEDIUM = 5x5, HIGH = 7x7.
     // 2D shadows (shadow2DQuality): NONE = 1 tap, LOW = 5, MEDIUM = 9, HIGH = 13 taps
@@ -93,6 +101,18 @@ namespace doriax{
         float ssrIntensity = 1.0f;     // reflection strength multiplier
         float ssrBlur = 0.0f;          // glossy blur amount [0..1] (0 = sharp/mirror)
         int ssrDebugMode = 0;          // 0=off,1=reflection,2=normal,3=roughness,4=metallic,5=albedo,6=IBL specular
+
+        // glow around the bright parts of the image, run ahead of the post-process chain
+        bool bloomEnabled = false;
+        float bloomThreshold = 0.8f;   // linear brightness where the glow starts, 1 is white
+        float bloomKnee = 0.5f;        // soft start below the threshold, as a share of it
+        float bloomIntensity = 1.0f;   // strength of the glow added over the image
+        float bloomRadius = 0.7f;      // 0 keeps the glow tight, 1 spreads it wide
+
+        // float scene color, then exposure and a tone curve before the post-process passes
+        bool hdrEnabled = false;
+        float exposure = 1.0f;
+        ToneMapping toneMapping = ToneMapping::NONE;
 
         // Initial physics gravity. The live value is owned by PhysicsSystem (it must be pushed
         // to the Box2D/Jolt worlds on change); this is the default it initializes from.

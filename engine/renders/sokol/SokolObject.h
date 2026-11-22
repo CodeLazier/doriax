@@ -55,6 +55,7 @@ namespace doriax{
         sg_pipeline rtt_invert_pip;
         sg_pipeline gbuffer_pip;
         sg_pipeline nodepth_pip;
+        sg_pipeline noblend_pip;
         sg_pipeline rtt_nodepth_pip;
         sg_pipeline rtt_noblend_pip;
         sg_pipeline rtt_coloronly_pip;
@@ -112,6 +113,8 @@ namespace doriax{
 
         // the shared pipelines belong to the current sokol context
         static void clearSharedPipelines();
+        // the color format of the pass being drawn, to pick float pipelines
+        static void setPassColorFormat(ColorFormat format);
         // the next draw applies pipeline and bindings again: called when a pass ends, when a buffer
         // or image is updated (sokol may move it to another backend resource) and on sokol errors
         static void resetAppliedState();

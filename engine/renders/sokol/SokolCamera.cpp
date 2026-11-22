@@ -58,6 +58,7 @@ void SokolCamera::setStoreDepth(bool storeDepth){
 void SokolCamera::startRenderPass(FramebufferRender* framebuffer, size_t face){
     pass.swapchain = {};
     pass.attachments = framebuffer->backend.get(face);
+    SokolObject::setPassColorFormat(framebuffer->getColorFormat());
     //SokolCmdQueue::add_command_begin_pass(pass);
     sg_begin_pass(pass);
 }
@@ -75,6 +76,7 @@ void SokolCamera::startRenderPass(TextureRender* texture, size_t face, int mip){
     pass.swapchain.invalid = (textureView.id == SG_INVALID_ID);
     pass.attachments = {};
     pass.attachments.colors[0] = textureView;
+    SokolObject::setPassColorFormat(texture->backend.getColorFormat());
     sg_begin_pass(pass);
 }
 
@@ -126,6 +128,7 @@ void SokolCamera::endRenderPass(){
     //SokolCmdQueue::add_command_end_pass();
     sg_end_pass();
     SokolObject::resetAppliedState();
+    SokolObject::setPassColorFormat(ColorFormat::RGBA);
 
     if (textureView.id != SG_INVALID_ID){
         sg_destroy_view(textureView);

@@ -57,7 +57,10 @@ namespace doriax{
         POSTPROCESS, // fullscreen user post-process pass
         WATER,      // water surface displaced by Gerstner waves
         UNDERWATER, // fullscreen fade of the scene seen from inside a water
-        PROBE_FILTER // reflection probe capture prefiltered into roughness mip levels
+        PROBE_FILTER, // reflection probe capture prefiltered into roughness mip levels
+        BLOOM_DOWNSAMPLE, // bright parts of the scene color, one half-size level down the bloom chain
+        BLOOM_UPSAMPLE,   // one bloom level spread over the next larger, or the glow over the scene
+        TONEMAP           // exposure and a tone curve from the scene color to the screen
     };
 
     enum class AttributeType{
@@ -149,7 +152,10 @@ namespace doriax{
         WATER_VS_PARAMS,
         WATER_FS_PARAMS,
         UNDERWATER_FS_PARAMS,
-        PROBE_FILTER_FS_PARAMS
+        PROBE_FILTER_FS_PARAMS,
+        BLOOM_DOWNSAMPLE_FS_PARAMS,
+        BLOOM_UPSAMPLE_FS_PARAMS,
+        TONEMAP_FS_PARAMS
     };
 
     enum class StorageBufferType{
@@ -191,7 +197,8 @@ namespace doriax{
         WATERREFRACTION,     // copy of the scene drawn before the water
         WATEREXCLUSION,      // hull maps of the volumes keeping the water out
         PROBESOURCE,         // reflection probe capture read by the prefilter
-        WATERWAKE            // foam and waves left by moving water exclusions
+        WATERWAKE,           // foam and waves left by moving water exclusions
+        BLOOMTEXTURE         // the bloom level a level spreads over, or the scene under the glow
     };
 
     enum class TextureType {
@@ -218,7 +225,8 @@ namespace doriax{
     enum class ColorFormat{
         RED,
         RGBA,
-        RED16 // single channel, 16-bit unsigned normalized (2 bytes/texel)
+        RED16, // single channel, 16-bit unsigned normalized (2 bytes/texel)
+        RGBA16F // four channels, 16-bit float, for HDR render targets
     };
 
     enum class TextureFilter{
@@ -255,7 +263,8 @@ namespace doriax{
         PIP_ZPREPASS    = 1 << 8, // depth only, into the swapchain color pass ahead of its opaque draws
         PIP_ZPREPASS_RTT = 1 << 9, // same into an offscreen color pass
         PIP_RTT_NOBLEND = 1 << 10, // offscreen, replaces the color without blending
-        PIP_RTT_COLORONLY = 1 << 11 // same into a pass with no depth attachment
+        PIP_RTT_COLORONLY = 1 << 11, // same into a pass with no depth attachment
+        PIP_DEFAULT_NOBLEND = 1 << 12 // swapchain, replaces the color without blending
     };
 
     //-------Start shader definition--------

@@ -38,6 +38,8 @@
 
 // local reflection probes the SSR composite rebuilds per view (composite.frag)
 #define SSR_PROBE_SLOTS 4
+// half-size levels of the bloom chain at most; the smallest stays about 8 pixels high
+#define BLOOM_MAX_LEVELS 8
 
 namespace doriax{
 	// mirrored by the u_fs_lighting block of mesh.frag and water.frag
@@ -76,9 +78,15 @@ namespace doriax{
 	} fs_reflection_probe_t;
 
 	typedef struct fs_probe_filter_t {
-		Vector4 params; // x = roughness, y = cube face, z = samples (taps per side when downsampling), w = 1 to downsample
+		Vector4 params; // x = roughness, y = cube face, z = samples (taps per side when downsampling), w = 1 to downsample, 2 for irradiance
 		Vector4 source; // x = destination level size, y = source base size, z = source mip count
 	} fs_probe_filter_t;
+
+	typedef struct fs_sky_t {
+		Vector4 color;        // sRGB
+		Vector4 sunDirection; // toward the strongest directional light, in the sky's space; w = 1 with one
+		Vector4 sunColor;     // its color times intensity, linear
+	} fs_sky_t;
 
 	typedef struct vs_shadow2d_t {
 		Vector4 lightPos_range; // xy = light world pos, w = range
@@ -159,6 +167,19 @@ namespace doriax{
 	typedef struct fs_blit_t {
 		Vector4 params; // x = flip source Y on sample (GL swapchain destination), yzw unused
 	} fs_blit_t;
+
+	typedef struct fs_bloom_down_t {
+		Vector4 params;    // xy = source texel size, z = 1 on the first level
+		Vector4 threshold; // x = threshold, y = knee width
+	} fs_bloom_down_t;
+
+	typedef struct fs_bloom_up_t {
+		Vector4 params; // xy = texel size of the smaller level, z = spread or intensity, w = 1 to add the glow over the scene
+	} fs_bloom_up_t;
+
+	typedef struct fs_tone_mapping_t {
+		Vector4 params; // x = exposure, y = ToneMapping curve
+	} fs_tone_mapping_t;
 
 	typedef struct vs_water_t {
 		Matrix4 modelMatrix;
@@ -337,7 +358,7 @@ namespace doriax{
 		bool hasFog;
 		bool hasIBL;
 		bool hasReflectionProbes;
-		// a water or mesh samples the scene depth
+		// a water, a mesh or a post-process pass samples the scene depth
 		bool hasWaterDepth;
 		// meshes whose shader files sample the opaque scene
 		std::set<Entity> sceneColorReaders;
@@ -398,6 +419,15 @@ namespace doriax{
 		std::shared_ptr<ShaderRender> probeFilterShader;
 		fs_probe_filter_t fs_probe_filter;
 		int probeFilterSlotParams;
+
+		// a sky drawn by a shader file lights the scene from a capture of itself, filtered as the probes are
+		FramebufferRender skyCaptureFramebuffer;
+		CameraRender skyCapturePass;
+		std::shared_ptr<TextureRender> skyCaptureIrradiance;
+		std::shared_ptr<TextureRender> skyCapturePrefiltered;
+		std::vector<uint8_t> skyCaptureInputs; // what the sky shader read for the last capture
+		float skyCaptureElapsed;
+		fs_sky_t fs_sky;
 
 		// Each mirror's reflection camera. Kept here so the authored component stays copiable.
 		std::unordered_map<Entity, Entity> mirrorCameras;
@@ -674,13 +704,14 @@ namespace doriax{
 		std::pair<int, int> compositeOcclusionSlot;               // u_occlusionGBufferTexture binding
 		TextureRender* ssrProbeTextures[SSR_PROBE_SLOTS]; // probes the G-buffer pass gave a slot
 		int ssrProbeCount;
-		bool swapchainRedirect;            // exported builds: the last pass targets the swapchain
+		Framebuffer* swapchainRedirect;    // exported builds: where update sent the frame, presented to the swapchain at the end
 
 		// Fixed game resolution: when enabled on the Engine main scene (Scene
 		// fixedResolution settings), the main camera renders into
 		// fixedResFramebuffer and a fullscreen blit pass upscales it to the
 		// real destination (view rect).
 		bool blitLoaded;
+		bool fixedResolutionActive;        // decided by update for its frame, with its target ready
 		unsigned int fixedResWidth;
 		unsigned int fixedResHeight;
 		Framebuffer fixedResFramebuffer;   // offscreen scene color at the fixed size
@@ -716,6 +747,30 @@ namespace doriax{
 		CameraRender postProcessPassRender;    // drives the offscreen post passes
 		std::vector<PostProcessRuntime> postProcessPasses;
 
+		// Bloom: bright parts blurred down half-size levels and back up, at the head of the post chain
+		bool bloomLoaded;
+		int bloomLevels;
+		unsigned int bloomWidth;               // size of the scene color it reads
+		unsigned int bloomHeight;
+		Framebuffer bloomDownFramebuffer[BLOOM_MAX_LEVELS];
+		Framebuffer bloomUpFramebuffer[BLOOM_MAX_LEVELS]; // the last level has none
+		CameraRender bloomPassRender;
+		ObjectRender bloomDownRender;
+		ObjectRender bloomUpRender;
+		std::shared_ptr<ShaderRender> bloomDownShader;
+		std::shared_ptr<ShaderRender> bloomUpShader;
+		fs_bloom_down_t fs_bloom_down;
+		fs_bloom_up_t fs_bloom_up;
+		int bloomDownSlotParams;
+		int bloomUpSlotParams;
+
+		// exposure and the tone curve, between bloom and the user passes
+		bool toneMappingLoaded;
+		ObjectRender toneMappingRender;
+		std::shared_ptr<ShaderRender> toneMappingShader;
+		fs_tone_mapping_t fs_tone_mapping;
+		int toneMappingSlotParams;
+
 		static void changeLoaded(void* data);
 		static void changeDestroy(void* data);
 		// water can share its entity with a mesh, so it has its own callbacks
@@ -727,6 +782,8 @@ namespace doriax{
 		static bool samplesCameraTarget(const CameraComponent& camera, const ShaderTextureValues& textures);
 		bool isRenderingFlipped(const CameraComponent& camera) const;
 		bool isFixedResolutionActive() const;
+		// decides fixed resolution for the frame and prepares its target
+		void updateFixedResolution();
 		void updateSwapchainRedirect();
 		void updateMVP(size_t index, Transform& transform, CameraComponent& camera, Transform& cameraTransform);
 
@@ -750,11 +807,24 @@ namespace doriax{
 		bool loadAndProcessFog();
 		void releaseSkyEnvironment(SkyComponent& sky);
 		void updateSkyEnvironment(SkyComponent& sky);
+		// drawn by a shader file, so its lighting comes from a capture
+		bool isSkyCaptured(const SkyComponent& sky) const;
+		// the tint and rotation, in radians, the sky's lighting maps take
+		Vector4 getSkyEnvironment(const SkyComponent& sky) const;
+		void updateSkyParams(const SkyComponent& sky);
+		void captureSky(SkyComponent& sky);
+		// the sky's lighting maps, black until it has them
+		void addSkyEnvironment(ObjectRender& render, ShaderData& shaderData);
+		void destroySkyCapture();
 		void updateReflectionProbes(double dt);
 		void renderReflectionProbeCapture();
 		void loadProbeFilter();
 		void destroyProbeFilter();
 		void filterReflectionProbes();
+		// prefilters a captured cube into the GGX levels, and the irradiance map when given
+		bool filterEnvironment(TextureRender& capture, int captureSize, ColorFormat format, TextureRender& prefiltered, TextureRender* irradiance);
+		// the cube face camera of a capture at position
+		void setCaptureCamera(CameraComponent& camera, Transform& transform, const Vector3& position, int face, float nearClip, float farClip);
 		void releaseReflectionProbeMaps(ReflectionProbeRuntime& runtime);
 		void destroyReflectionProbe(Entity entity, ReflectionProbeComponent& probe);
 		bool selectReflectionProbe(const Vector3& worldPosition, fs_reflection_probe_t& params, TextureRender*& texture);
@@ -819,6 +889,7 @@ namespace doriax{
 		void flushSpriteBatch();
 		void prepareSpriteBatchBuffers();
 		void settleSprite(Entity entity, Signature signature, MeshComponent& mesh, const Transform& transform);
+		void updateMeshBounds(Entity entity, Signature signature, MeshComponent& mesh, const Transform& transform, bool instanced);
 		void unsettleSprite(Entity entity);
 		void unsettleSprites();
 		int settledIndex(Entity entity) const{
@@ -910,7 +981,9 @@ namespace doriax{
 		void loadBlit();
 		void destroyBlit();
 		bool ensureFixedResFramebuffer(unsigned int width, unsigned int height, TextureFilter filter);
-		// draws source over destination (the swapchain when null), in viewport or the whole target
+		// cleared to the background; the engine framebuffer keeps the scene in its view rect
+		void startFullscreenPass(CameraRender& passRender, FramebufferRender* target);
+		// copies source into destination (the swapchain when null), in viewport or the whole target
 		void renderBlit(TextureRender* source, FramebufferRender* destination, const Rect* viewport);
 		// the fullscreen blit draw alone, in the pass already started
 		void drawBlit(TextureRender* source, PipelineType pipeline, bool flipY);
@@ -924,8 +997,30 @@ namespace doriax{
 		void updatePostProcessUniforms();
 		void destroyPostProcess();
 		bool ensurePostProcessFramebuffers(unsigned int width, unsigned int height);
-		// runs the chain from ping-pong buffer 0 into destination (swapchain when null)
-		void renderPostProcess(FramebufferRender* destination);
+		// loads the engine stages and the buffers for this size; false when nothing would run
+		bool preparePostProcess(unsigned int width, unsigned int height, bool& bloom, bool& toneMapping);
+		// runs bloom, tone mapping and the chain from ping-pong buffer 0 into destination (swapchain when null)
+		void renderPostProcess(FramebufferRender* destination, bool bloom, bool toneMapping);
+
+		// bloom
+		void loadBloom();
+		void destroyBloom();
+		bool ensureBloomFramebuffers(unsigned int width, unsigned int height);
+		void destroyBloomFramebuffers();
+		// source with its glow added, into destination
+		void renderBloom(TextureRender* source, FramebufferRender* destination);
+
+		// the camera runs bloom, tone mapping or the user passes over its image
+		bool wantsPostProcess(const CameraComponent& camera) const;
+
+		// HDR and tone mapping
+		bool isHDRActive() const;
+		bool needsToneMapping() const;
+		// of the main camera targets the chain reads: float with HDR
+		ColorFormat getSceneColorFormat() const;
+		void loadToneMapping();
+		void destroyToneMapping();
+		void renderToneMapping(TextureRender* source, FramebufferRender* destination);
 
 		bool drawUI(UIComponent& ui, Transform& transform, PipelineType pipType);
 		void destroyUI(Entity entity, UIComponent& ui);
@@ -959,6 +1054,7 @@ namespace doriax{
 		void destroyCamera(CameraComponent& camera, bool entityDestroyed);
 		
 		void updateSkyViewProjection(SkyComponent& sky, CameraComponent& camera);
+		Matrix4 getSkyViewProjection(const CameraComponent& camera, float rotation) const;
 		void updateLightFromScene(LightComponent& light, Transform& transform, CameraComponent& camera, Transform& cameraTransform);
 		void updatePoints(PointsComponent& points, Transform& transform, CameraComponent& camera, Transform& camTransform);
 		void updateTerrain(TerrainComponent& terrain, Transform& transform, CameraComponent& camera, Transform& cameraTransform, int viewIndex);
@@ -1100,6 +1196,10 @@ namespace doriax{
 
 		void updateFramebuffer(CameraComponent& camera);
 		void updateTransform(Transform& transform, Entity entity);
+		// world matrices only, needUpdate stays set for the next update
+		void updateTransforms();
+		// mesh world boxes from the current transforms, flags stay set for the next update
+		void updateWorldBounds();
 		void updateCamera(CameraComponent& camera, Transform& transform);
 		void updateMirrors(Entity mainCameraEntity);
 		Entity createMirrorCamera(Entity mirrorEntity);

@@ -3066,7 +3066,12 @@ std::filesystem::path editor::App::getUserShaderCacheDir(){
     // v74: depth reads the surface normal, unlit hooks match.
     // v75: vertex color in hook surfaces, flat normals fixed.
     // v76: morphed hook normals, flat normals without lights.
-    return App::getUserCacheBaseDir() / "doriax" / "shaders" / "v76";
+    // v77: bloom passes.
+    // v78: tone mapping.
+    // v79: sky sun, irradiance filter.
+    // v80: sky shaders flag the sun they read.
+    // v81: the sun flag from any expression reading it.
+    return App::getUserCacheBaseDir() / "doriax" / "shaders" / "v81";
 }
 
 void editor::App::pushTabNotificationStyle(){

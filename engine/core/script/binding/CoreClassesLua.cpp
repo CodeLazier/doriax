@@ -349,6 +349,14 @@ void LuaBinding::registerCoreClasses(lua_State *L){
         .endNamespace();
 
     luabridge::getGlobalNamespace(L)
+        .beginNamespace("ToneMapping")
+        .addVariable("NONE", ToneMapping::NONE)
+        .addVariable("REINHARD", ToneMapping::REINHARD)
+        .addVariable("ACES", ToneMapping::ACES)
+        .addVariable("AGX", ToneMapping::AGX)
+        .endNamespace();
+
+    luabridge::getGlobalNamespace(L)
         .beginNamespace("UIEventState")
         .addVariable("NOT_SET", UIEventState::NOT_SET)
         .addVariable("ENABLED", UIEventState::ENABLED)
@@ -1016,6 +1024,14 @@ void LuaBinding::registerCoreClasses(lua_State *L){
         .addProperty("ssrIntensity", &Scene::getSSRIntensity, &Scene::setSSRIntensity)
         .addProperty("ssrBlur", &Scene::getSSRBlur, &Scene::setSSRBlur)
         .addProperty("ssrDebugMode", &Scene::getSSRDebugMode, &Scene::setSSRDebugMode)
+        .addProperty("bloomEnabled", &Scene::isBloomEnabled, &Scene::setBloomEnabled)
+        .addProperty("bloomThreshold", &Scene::getBloomThreshold, &Scene::setBloomThreshold)
+        .addProperty("bloomKnee", &Scene::getBloomKnee, &Scene::setBloomKnee)
+        .addProperty("bloomIntensity", &Scene::getBloomIntensity, &Scene::setBloomIntensity)
+        .addProperty("bloomRadius", &Scene::getBloomRadius, &Scene::setBloomRadius)
+        .addProperty("hdrEnabled", &Scene::isHDREnabled, &Scene::setHDREnabled)
+        .addProperty("exposure", &Scene::getExposure, &Scene::setExposure)
+        .addProperty("toneMapping", &Scene::getToneMapping, &Scene::setToneMapping)
         .addProperty("fixedResolutionEnabled", &Scene::isFixedResolutionEnabled, &Scene::setFixedResolutionEnabled)
         .addProperty("fixedResolutionWidth", &Scene::getFixedResolutionWidth, &Scene::setFixedResolutionWidth)
         .addProperty("fixedResolutionHeight", &Scene::getFixedResolutionHeight, &Scene::setFixedResolutionHeight)

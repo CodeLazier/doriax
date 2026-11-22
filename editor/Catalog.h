@@ -235,6 +235,7 @@ namespace doriax::editor{
                 if constexpr (std::is_same_v<T, int>) return 0;
                 if constexpr (std::is_same_v<T, LightState>) return LightState::AUTO;
                 if constexpr (std::is_same_v<T, ShadowQuality>) return ShadowQuality::LOW;
+                if constexpr (std::is_same_v<T, ToneMapping>) return ToneMapping::NONE;
                 if constexpr (std::is_same_v<T, TextureFilter>) return TextureFilter::NEAREST;
                 if constexpr (std::is_same_v<T, std::string>) return std::string();
                 if constexpr (std::is_same_v<T, ShaderUniformValues>) return ShaderUniformValues();
@@ -371,6 +372,46 @@ namespace doriax::editor{
                     return scene->getSSRDebugMode();
                 }
             }
+            else if (propertyName == "bloom_enabled") {
+                if constexpr (std::is_same_v<T, bool>) {
+                    return scene->isBloomEnabled();
+                }
+            }
+            else if (propertyName == "bloom_threshold") {
+                if constexpr (std::is_same_v<T, float>) {
+                    return scene->getBloomThreshold();
+                }
+            }
+            else if (propertyName == "bloom_knee") {
+                if constexpr (std::is_same_v<T, float>) {
+                    return scene->getBloomKnee();
+                }
+            }
+            else if (propertyName == "bloom_intensity") {
+                if constexpr (std::is_same_v<T, float>) {
+                    return scene->getBloomIntensity();
+                }
+            }
+            else if (propertyName == "bloom_radius") {
+                if constexpr (std::is_same_v<T, float>) {
+                    return scene->getBloomRadius();
+                }
+            }
+            else if (propertyName == "hdr_enabled") {
+                if constexpr (std::is_same_v<T, bool>) {
+                    return scene->isHDREnabled();
+                }
+            }
+            else if (propertyName == "exposure") {
+                if constexpr (std::is_same_v<T, float>) {
+                    return scene->getExposure();
+                }
+            }
+            else if (propertyName == "tone_mapping") {
+                if constexpr (std::is_same_v<T, ToneMapping>) {
+                    return scene->getToneMapping();
+                }
+            }
             else if (propertyName == "fixed_resolution_enabled") {
                 if constexpr (std::is_same_v<T, bool>) {
                     return scene->isFixedResolutionEnabled();
@@ -445,6 +486,7 @@ namespace doriax::editor{
             if constexpr (std::is_same_v<T, int>) return 0;
             if constexpr (std::is_same_v<T, LightState>) return LightState::AUTO;
                 if constexpr (std::is_same_v<T, ShadowQuality>) return ShadowQuality::LOW;
+                if constexpr (std::is_same_v<T, ToneMapping>) return ToneMapping::NONE;
             if constexpr (std::is_same_v<T, TextureFilter>) return TextureFilter::NEAREST;
             if constexpr (std::is_same_v<T, std::string>) return std::string();
             if constexpr (std::is_same_v<T, std::vector<PostProcessPass>>) return std::vector<PostProcessPass>();
@@ -539,6 +581,30 @@ namespace doriax::editor{
             }
             else if (propertyName == "ssr_debug_mode") {
                 if constexpr (std::is_same_v<T, int>) return d.ssrDebugMode;
+            }
+            else if (propertyName == "bloom_enabled") {
+                if constexpr (std::is_same_v<T, bool>) return d.bloomEnabled;
+            }
+            else if (propertyName == "bloom_threshold") {
+                if constexpr (std::is_same_v<T, float>) return d.bloomThreshold;
+            }
+            else if (propertyName == "bloom_knee") {
+                if constexpr (std::is_same_v<T, float>) return d.bloomKnee;
+            }
+            else if (propertyName == "bloom_intensity") {
+                if constexpr (std::is_same_v<T, float>) return d.bloomIntensity;
+            }
+            else if (propertyName == "bloom_radius") {
+                if constexpr (std::is_same_v<T, float>) return d.bloomRadius;
+            }
+            else if (propertyName == "hdr_enabled") {
+                if constexpr (std::is_same_v<T, bool>) return d.hdrEnabled;
+            }
+            else if (propertyName == "exposure") {
+                if constexpr (std::is_same_v<T, float>) return d.exposure;
+            }
+            else if (propertyName == "tone_mapping") {
+                if constexpr (std::is_same_v<T, ToneMapping>) return d.toneMapping;
             }
             else if (propertyName == "fixed_resolution_enabled") {
                 if constexpr (std::is_same_v<T, bool>) return d.fixedResolutionEnabled;
@@ -713,6 +779,46 @@ namespace doriax::editor{
             else if (propertyName == "ssr_debug_mode") {
                 if constexpr (std::is_same_v<T, int>) {
                     scene->setSSRDebugMode(value);
+                }
+            }
+            else if (propertyName == "bloom_enabled") {
+                if constexpr (std::is_same_v<T, bool>) {
+                    scene->setBloomEnabled(value);
+                }
+            }
+            else if (propertyName == "bloom_threshold") {
+                if constexpr (std::is_same_v<T, float>) {
+                    scene->setBloomThreshold(value);
+                }
+            }
+            else if (propertyName == "bloom_knee") {
+                if constexpr (std::is_same_v<T, float>) {
+                    scene->setBloomKnee(value);
+                }
+            }
+            else if (propertyName == "bloom_intensity") {
+                if constexpr (std::is_same_v<T, float>) {
+                    scene->setBloomIntensity(value);
+                }
+            }
+            else if (propertyName == "bloom_radius") {
+                if constexpr (std::is_same_v<T, float>) {
+                    scene->setBloomRadius(value);
+                }
+            }
+            else if (propertyName == "hdr_enabled") {
+                if constexpr (std::is_same_v<T, bool>) {
+                    scene->setHDREnabled(value);
+                }
+            }
+            else if (propertyName == "exposure") {
+                if constexpr (std::is_same_v<T, float>) {
+                    scene->setExposure(value);
+                }
+            }
+            else if (propertyName == "tone_mapping") {
+                if constexpr (std::is_same_v<T, ToneMapping>) {
+                    scene->setToneMapping(value);
                 }
             }
             else if (propertyName == "fixed_resolution_enabled") {

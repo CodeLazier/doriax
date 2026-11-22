@@ -574,6 +574,10 @@ void setupShaderParameters(shadercompiler::args_t& args, const std::string& shad
         if ((useVertexHooks && vertexReads.count("color")) || (useFragmentHooks && fragmentReads.count("color")))
             declared.flags |= ShaderFlag_VertexColor;
     }
+    // a sky's lighting is captured again for the sun only when it reads it, as (context).sunColor too
+    const std::set<std::string>& members = fragmentHooks.memberReads;
+    if (passType == ShaderType::SKYBOX && useFragmentHooks && (members.count("sunDirection") || members.count("sunColor")))
+        declared.flags |= ShaderFlag_SkySun;
 
     // the model matrix of the types whose own blocks lack it
     const bool modelMatrix = primitive && (useVertexHooks || defined("HOOK_FRAGMENT_POSITION"));
@@ -1219,6 +1223,15 @@ bool editor::ShaderBuilder::setupShaderArgs(shadercompiler::args_t& args, Shader
     }else if (shaderType == ShaderType::PROBE_FILTER){
         args.vert_file = "fullscreen.vert";
         args.frag_file = "probe_filter.frag";
+    }else if (shaderType == ShaderType::BLOOM_DOWNSAMPLE){
+        args.vert_file = "fullscreen.vert";
+        args.frag_file = "bloom_down.frag";
+    }else if (shaderType == ShaderType::BLOOM_UPSAMPLE){
+        args.vert_file = "fullscreen.vert";
+        args.frag_file = "bloom_up.frag";
+    }else if (shaderType == ShaderType::TONEMAP){
+        args.vert_file = "fullscreen.vert";
+        args.frag_file = "tonemap.frag";
     }else{
         return false;
     }

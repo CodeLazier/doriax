@@ -4208,6 +4208,8 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
         }
     }
 
+    // a sky drawn by a shader file is filtered into its lighting as the probes are
+    bool capturedSky = false;
     for (Entity entity : shaderEntities) {
         Signature signature = scene->getSignature(entity);
 
@@ -4226,9 +4228,9 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
                     const uint16_t customShaderId = ShaderPool::registerCustomShader(materialShader);
                     uint32_t meshProperties = mesh.submeshes[s].shaderProperties;
                     // Saving/exporting can happen before RenderSystem has reloaded
-                    // meshes after a probe was added. Derive the required IBL
+                    // meshes after a probe or an IBL sky was added. Derive the required IBL
                     // variant here so the exported shader set is still complete.
-                    if (hasReflectionProbes && mesh.receiveLights && mesh.receiveIBL) {
+                    if ((hasReflectionProbes || authoredShading.ibl) && mesh.receiveLights && mesh.receiveIBL) {
                         meshProperties &= ~(1u << 0); // no longer MATERIAL_UNLIT
                         meshProperties |= (1u << 6);  // HAS_NORMALS
                         meshProperties |= (1u << 19); // USE_IBL
@@ -4246,6 +4248,14 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
                         }
                     }
                     insertKeys(ShaderType::MESH, meshProperties, customShaderId);
+                    // and the one a reload takes from the scene as it is now, as after a sky change
+                    if (!isTerrain && (mesh.buffer.getSize() > 0 || mesh.numExternalBuffers > 0)) {
+                        const bool skinned = signature.test(scene->getComponentId<SkinComponent>());
+                        const RenderSystem::SubmeshAttributes attributes = RenderSystem::getSubmeshAttributes(mesh, s, skinned);
+                        const RenderSystem::SubmeshShading shading = renderSystem->getSubmeshShading(entity, mesh, s, attributes, authoredShading,
+                            scene->findComponent<InstancedMeshComponent>(entity), nullptr);
+                        insertKeys(ShaderType::MESH, shading.properties, shading.shaderFileId);
+                    }
                     // The runtime only computes depthShaderProperties while
                     // shadows or SSAO are active, so the
                     // stored value can be a stale 0 for scenes whose shadow lights
@@ -4311,7 +4321,9 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
 
         if (signature.test(scene->getComponentId<SkyComponent>())) {
             const SkyComponent& sky = scene->getComponent<SkyComponent>(entity);
-            insertKeys(ShaderType::SKYBOX, 0, effectiveShaderId(sky.shader, ShaderType::SKYBOX));
+            const uint16_t skyShaderId = effectiveShaderId(sky.shader, ShaderType::SKYBOX);
+            insertKeys(ShaderType::SKYBOX, 0, skyShaderId);
+            capturedSky = capturedSky || skyShaderId != 0;
         }
 
         // from the authored fields, as the cached variant lacks fog while the editor hides it
@@ -4340,7 +4352,7 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
         keys.insert(ShaderPool::getShaderKey(ShaderType::SSAO_BLUR, 0));
     }
 
-    if (hasReflectionProbes) {
+    if (hasReflectionProbes || capturedSky) {
         keys.insert(ShaderPool::getShaderKey(ShaderType::PROBE_FILTER, 0));
     }
 
@@ -4349,6 +4361,11 @@ void editor::Project::collectSceneShaderKeys(const SceneProject* sceneProject, s
         keys.insert(ShaderPool::getShaderKey(ShaderType::SSR_BLUR, 0));
         keys.insert(ShaderPool::getShaderKey(ShaderType::COMPOSITE, 0));
     }
+
+    // scripts can turn bloom and tone mapping on at any time
+    keys.insert(ShaderPool::getShaderKey(ShaderType::BLOOM_DOWNSAMPLE, 0));
+    keys.insert(ShaderPool::getShaderKey(ShaderType::BLOOM_UPSAMPLE, 0));
+    keys.insert(ShaderPool::getShaderKey(ShaderType::TONEMAP, 0));
 
     // disabled passes ship too: the generated scene carries the whole chain
     for (const PostProcessPass& pass : scene->getPostProcessPasses()) {

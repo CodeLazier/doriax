@@ -1013,6 +1013,12 @@ FogType editor::Stream::stringToFogType(const std::string& str) {
     return FogType::LINEAR;
 }
 
+// Scenes saved on Windows before v0.8.5 used '\' in script paths
+static std::string genericScriptPath(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return path;
+}
+
 // scene keys of the default shaders' uniform values
 static const std::pair<ShaderType, const char*> defaultShaderUniformKeys[] = {
     {ShaderType::MESH, "defaultMeshShaderUniforms"},
@@ -1031,6 +1037,22 @@ static std::string shadowQualityToString(ShadowQuality quality) {
         case ShadowQuality::HIGH: return "high";
     }
     return "low";
+}
+
+static std::string toneMappingToString(ToneMapping toneMapping) {
+    switch (toneMapping) {
+        case ToneMapping::REINHARD: return "reinhard";
+        case ToneMapping::ACES: return "aces";
+        case ToneMapping::AGX: return "agx";
+        default: return "none";
+    }
+}
+
+static ToneMapping stringToToneMapping(const std::string& str) {
+    if (str == "reinhard") return ToneMapping::REINHARD;
+    if (str == "aces") return ToneMapping::ACES;
+    if (str == "agx") return ToneMapping::AGX;
+    return ToneMapping::NONE;
 }
 
 static ShadowQuality stringToShadowQuality(const std::string& str) {
@@ -2822,10 +2844,10 @@ void editor::Stream::decodeSceneProject(SceneProject* sceneProject, const YAML::
             SceneScriptSource script;
 
             if (scriptNode["path"]) {
-                script.path = fs::path(scriptNode["path"].as<std::string>());
+                script.path = fs::path(genericScriptPath(scriptNode["path"].as<std::string>()));
             }
             if (scriptNode["headerPath"]) {
-                script.headerPath = fs::path(scriptNode["headerPath"].as<std::string>());
+                script.headerPath = fs::path(genericScriptPath(scriptNode["headerPath"].as<std::string>()));
             }
             if (scriptNode["className"]) {
                 script.className = scriptNode["className"].as<std::string>();
@@ -2851,7 +2873,7 @@ void editor::Stream::decodeSceneProject(SceneProject* sceneProject, const YAML::
     } else if (node["cppScriptPaths"]) {
         for (const auto& pathNode : node["cppScriptPaths"]) {
             SceneScriptSource script;
-            script.path = fs::path(pathNode.as<std::string>());
+            script.path = fs::path(genericScriptPath(pathNode.as<std::string>()));
             sceneProject->cppScripts.push_back(script);
         }
     }
@@ -3034,6 +3056,14 @@ YAML::Node editor::Stream::encodeScene(Scene* scene) {
     sceneNode["ssrMaxSteps"] = scene->getSSRMaxSteps();
     sceneNode["ssrIntensity"] = scene->getSSRIntensity();
     sceneNode["ssrBlur"] = scene->getSSRBlur();
+    sceneNode["bloomEnabled"] = scene->isBloomEnabled();
+    sceneNode["bloomThreshold"] = scene->getBloomThreshold();
+    sceneNode["bloomKnee"] = scene->getBloomKnee();
+    sceneNode["bloomIntensity"] = scene->getBloomIntensity();
+    sceneNode["bloomRadius"] = scene->getBloomRadius();
+    sceneNode["hdrEnabled"] = scene->isHDREnabled();
+    sceneNode["exposure"] = scene->getExposure();
+    sceneNode["toneMapping"] = toneMappingToString(scene->getToneMapping());
     sceneNode["gravity2D"] = encodeVector2(scene->getGravity2D());
     sceneNode["gravity3D"] = encodeVector3(scene->getGravity3D());
     if (!scene->getShaderParameterDefaults().empty())
@@ -3160,6 +3190,30 @@ Scene* editor::Stream::decodeScene(Scene* scene, const YAML::Node& node) {
     }
     if (node["ssrBlur"]) {
         scene->setSSRBlur(node["ssrBlur"].as<float>());
+    }
+    if (node["bloomEnabled"]) {
+        scene->setBloomEnabled(node["bloomEnabled"].as<bool>());
+    }
+    if (node["bloomThreshold"]) {
+        scene->setBloomThreshold(node["bloomThreshold"].as<float>());
+    }
+    if (node["bloomKnee"]) {
+        scene->setBloomKnee(node["bloomKnee"].as<float>());
+    }
+    if (node["bloomIntensity"]) {
+        scene->setBloomIntensity(node["bloomIntensity"].as<float>());
+    }
+    if (node["bloomRadius"]) {
+        scene->setBloomRadius(node["bloomRadius"].as<float>());
+    }
+    if (node["hdrEnabled"]) {
+        scene->setHDREnabled(node["hdrEnabled"].as<bool>());
+    }
+    if (node["exposure"]) {
+        scene->setExposure(node["exposure"].as<float>());
+    }
+    if (node["toneMapping"]) {
+        scene->setToneMapping(stringToToneMapping(node["toneMapping"].as<std::string>()));
     }
 
     // absent key restores the engine default so decoding into a reused scene (play restore) is exact
@@ -6723,10 +6777,10 @@ ScriptComponent editor::Stream::decodeScriptComponent(const YAML::Node& node, co
         }
 
         if (scriptNode["path"])
-            entry.path = scriptNode["path"].as<std::string>();
+            entry.path = genericScriptPath(scriptNode["path"].as<std::string>());
 
         if (scriptNode["headerPath"])
-            entry.headerPath = scriptNode["headerPath"].as<std::string>();
+            entry.headerPath = genericScriptPath(scriptNode["headerPath"].as<std::string>());
 
         if (scriptNode["className"])
             entry.className = scriptNode["className"].as<std::string>();

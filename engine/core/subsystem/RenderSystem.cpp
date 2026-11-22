@@ -20,6 +20,7 @@
 #include "math/AABB.h"
 #include "pool/TextureDataPool.h"
 #include "subsystem/PhysicsSystem.h"
+#include "subsystem/MeshSystem.h"
 #include <memory>
 #include <algorithm>
 #include <array>
@@ -41,6 +42,9 @@ namespace {
     constexpr uint32_t SPRITE_SETTLE_HOLD = 4;
     constexpr uint32_t SPRITE_SETTLE_WAIT = 30;
     constexpr uint32_t SPRITE_SETTLE_WAIT_MAX = 960;
+    // a shader sky's capture size, and how often a sky that keeps changing is captured again
+    constexpr int SKY_CAPTURE_SIZE = 256;
+    constexpr float SKY_CAPTURE_INTERVAL = 0.1f;
 
     // the sprite batches move vertices on the CPU with w = 1; a projective model matrix keeps its w on the GPU
     bool hasAffineModel(const Transform& transform){
@@ -275,16 +279,40 @@ namespace {
         applyParameters(render, block, view, resolution);
     }
 
+    // of the lighting maps, float where it renders so a sky brighter than white lights as bright
+    ColorFormat environmentFormat(){
+        return FramebufferRender::isColorFormatSupported(ColorFormat::RGBA16F) ? ColorFormat::RGBA16F : ColorFormat::RGBA;
+    }
+
+    // a framebuffer the shader samples, which changes with no value changing
+    bool samplesFramebuffer(const ShaderTextureValues& textures, ShaderData& shaderData){
+        for (const ShaderTextureInfo& parameter : shaderData.textureParameters){
+            if (shaderData.getTextureParameterIndex(parameter).first == -1)
+                continue;
+            const Texture* texture = ShaderTextures::find(textures, parameter.name);
+            if (texture && texture->isFramebuffer())
+                return true;
+        }
+        return false;
+    }
+
+    // both stages of a single-shader component, when its values changed
+    template<typename T>
+    void writeComponentParameters(T& component, const Scene* scene, ShaderType type){
+        if (!component.needUpdateShaderUniforms)
+            return;
+
+        const ShaderUniformValues* inherited = scene->getInheritedShaderUniforms(type, component.shader);
+        component.paramsVS.writeObject(component.shaderUniforms, inherited);
+        component.paramsFS.writeObject(component.shaderUniforms, inherited);
+        component.needUpdateShaderUniforms = false;
+    }
+
     // both stages of a single-shader component, rewritten first when its values changed
     template<typename T>
     void applyParameters(ObjectRender& render, T& component, const Scene* scene, ShaderType type, const Matrix4& modelMatrix,
                          const ShaderEffectView& view, const Vector2& resolution){
-        if (component.needUpdateShaderUniforms){
-            const ShaderUniformValues* inherited = scene->getInheritedShaderUniforms(type, component.shader);
-            component.paramsVS.writeObject(component.shaderUniforms, inherited);
-            component.paramsFS.writeObject(component.shaderUniforms, inherited);
-            component.needUpdateShaderUniforms = false;
-        }
+        writeComponentParameters(component, scene, type);
         component.paramsVS.writeVertexContext(view, modelMatrix, 0.0f);
         applyParameters(render, component.paramsVS, view, resolution);
         applyParameters(render, component.paramsFS, view, resolution);
@@ -480,15 +508,17 @@ RenderSystem::RenderSystem(Scene* scene): SubSystem(scene){
     }
     compositeOcclusionSlot = std::pair<int, int>(-1, -1);
     ssrProbeCount = 0;
-    swapchainRedirect = false;
+    swapchainRedirect = nullptr;
 
     blitLoaded = false;
+    fixedResolutionActive = false;
     fixedResWidth = 0;
     fixedResHeight = 0;
     blitSlotParams = -1;
 
     probeFilterLoaded = false;
     probeSourceSize = 0;
+    skyCaptureElapsed = 0.0f;
     probeFilterSlotParams = -1;
 
     postProcessLoaded = false;
@@ -498,6 +528,16 @@ RenderSystem::RenderSystem(Scene* scene): SubSystem(scene){
     postProcessHeight = 0;
     postProcessNeedsDepth = false;
     postProcessNeedsGBuffer = false;
+
+    bloomLoaded = false;
+    bloomLevels = 0;
+    bloomWidth = 0;
+    bloomHeight = 0;
+    bloomDownSlotParams = -1;
+    bloomUpSlotParams = -1;
+
+    toneMappingLoaded = false;
+    toneMappingSlotParams = -1;
 
     shadowAtlasSlotResolution = 0;
     shadowAtlasCols = 0;
@@ -588,7 +628,10 @@ void RenderSystem::destroy(){
     destroySSR();
     destroyBlit();
     destroyProbeFilter();
+    destroySkyCapture();
     destroyPostProcess();
+    destroyBloom();
+    destroyToneMapping();
     for (InstanceView& view : instanceViews){
         view.buffer.getRender()->destroyBuffer();
         view.data.clear();
@@ -1301,9 +1344,7 @@ void RenderSystem::processLights(int numLights, CameraComponent& camera, Transfo
     if (hasIBL){
         auto skys = scene->getComponentArray<SkyComponent>();
         if (skys->size() > 0){
-            SkyComponent& sky = skys->getComponentFromIndex(0);
-            Vector3 linColor = Color::sRGBToLinear(Vector3(sky.color.x, sky.color.y, sky.color.z));
-            fs_lighting.envColor = Vector4(linColor.x, linColor.y, linColor.z, Angle::defaultToRad(sky.rotation));
+            fs_lighting.envColor = getSkyEnvironment(skys->getComponentFromIndex(0));
         }
     }
 
@@ -1314,8 +1355,8 @@ void RenderSystem::processLights(int numLights, CameraComponent& camera, Transfo
     float vpH = Engine::getViewRect().getHeight();
     if (isFixedResolutionActive() && !camera.renderToTexture){
         // the main color pass renders into the fixed-resolution target
-        vpW = (float)scene->getFixedResolutionWidth();
-        vpH = (float)scene->getFixedResolutionHeight();
+        vpW = (float)fixedResWidth;
+        vpH = (float)fixedResHeight;
     }
     fs_lighting.viewportInfo = Vector4(
         (vpW > 0.0f) ? 1.0f / vpW : 0.0f,
@@ -1493,9 +1534,159 @@ void RenderSystem::releaseSkyEnvironment(SkyComponent& sky){
     sky.envMapsLoaded = false;
 }
 
+bool RenderSystem::isSkyCaptured(const SkyComponent& sky) const{
+    return !(sky.shader.empty() ? scene->getDefaultCustomShader(ShaderType::SKYBOX) : sky.shader).empty();
+}
+
+// a capture has the tint the shader drew
+Vector4 RenderSystem::getSkyEnvironment(const SkyComponent& sky) const{
+    const Vector3 tint = isSkyCaptured(sky) ? Vector3(1.0f, 1.0f, 1.0f) : Color::sRGBToLinear(Vector3(sky.color.x, sky.color.y, sky.color.z));
+    return Vector4(tint.x, tint.y, tint.z, Angle::defaultToRad(sky.rotation));
+}
+
+// the sky's color, and the strongest directional light as its sun
+void RenderSystem::updateSkyParams(const SkyComponent& sky){
+    fs_sky.color = sky.color;
+    fs_sky.sunDirection = Vector4(0.0f, 1.0f, 0.0f, 0.0f);
+    fs_sky.sunColor = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // the sky's own space, as its directions are
+    const Quaternion worldToSky(0, -sky.rotation, 0);
+    float strongest = 0.0f;
+    auto lights = scene->getComponentArray<LightComponent>();
+    for (int i = 0; i < lights->size(); i++){
+        const LightComponent& light = lights->getComponentFromIndex(i);
+        if (light.type != LightType::DIRECTIONAL || light.intensity <= strongest)
+            continue;
+
+        strongest = light.intensity;
+        const Vector3 toSun = worldToSky * (-light.worldDirection.normalized());
+        fs_sky.sunDirection = Vector4(toSun.x, toSun.y, toSun.z, 1.0f);
+        fs_sky.sunColor = Vector4(light.color.x * light.intensity, light.color.y * light.intensity, light.color.z * light.intensity, 0.0f);
+    }
+}
+
+// Draws the sky into a cube in its own space, as mesh lighting turns it with sky.rotation,
+// and filters it into the lighting maps. It runs again when what the shader reads changes.
+void RenderSystem::captureSky(SkyComponent& sky){
+    if (!sky.loaded || !isSkyCaptured(sky))
+        return;
+
+    Transform captureTransform;
+    CameraComponent captureCamera;
+    // a camera makes its own framebuffer, which a capture never uses
+    const std::unique_ptr<Framebuffer> unusedFramebuffer(captureCamera.framebuffer);
+    setCaptureCamera(captureCamera, captureTransform, Vector3(0.0f, 0.0f, 0.0f), 0, 0.1f, 10.0f);
+    // no camera owns a capture, so view parameters read their declared defaults
+    setEffectView(NULL_ENTITY, captureCamera, captureTransform);
+    const Vector2 resolution((float)SKY_CAPTURE_SIZE, (float)SKY_CAPTURE_SIZE);
+
+    // what the shader reads, as the capture would write it; the sun only when it reads it
+    writeComponentParameters(sky, scene, ShaderType::SKYBOX);
+    sky.paramsFS.writeFrame(effectView, resolution);
+    fs_sky_t read = fs_sky;
+    if (!(sky.shaderRender->shaderData.flags & ShaderFlag_SkySun)){
+        read.sunDirection = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+        read.sunColor = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    // the background shows where the sky is transparent
+    const Vector4 background = scene->getBackgroundColor();
+    std::vector<uint8_t> inputs(sizeof(fs_sky_t) + sizeof(Vector4) + sky.paramsFS.data.size());
+    std::memcpy(inputs.data(), &read, sizeof(fs_sky_t));
+    std::memcpy(inputs.data() + sizeof(fs_sky_t), &background, sizeof(Vector4));
+    if (!sky.paramsFS.data.empty())
+        std::memcpy(inputs.data() + sizeof(fs_sky_t) + sizeof(Vector4), sky.paramsFS.data.data(), sky.paramsFS.data.size());
+
+    // a framebuffer it samples changes without a value changing; a sky that keeps changing
+    // is captured again every SKY_CAPTURE_INTERVAL at most
+    const bool live = sky.texture.isFramebuffer() || samplesFramebuffer(sky.shaderTextures, sky.shaderRender->shaderData);
+    const bool changed = live || inputs != skyCaptureInputs;
+    if (!sky.needUpdateEnvironment && (!changed || skyCaptureElapsed < SKY_CAPTURE_INTERVAL))
+        return;
+
+    const ColorFormat format = environmentFormat();
+    if (!skyCaptureFramebuffer.isCreated() && !skyCaptureFramebuffer.createFramebuffer(TextureType::TEXTURE_CUBE,
+            SKY_CAPTURE_SIZE, SKY_CAPTURE_SIZE, TextureFilter::LINEAR, TextureFilter::LINEAR, TextureWrap::CLAMP_TO_EDGE, TextureWrap::CLAMP_TO_EDGE, false, format))
+        return;
+
+    const Matrix4 viewProjection = sky.skyViewProjectionMatrix;
+    capturingReflectionProbe = true;
+    passResolution = resolution;
+    skyCapturePass.setClearColor(background);
+    for (int face = 0; face < 6; face++){
+        setCaptureCamera(captureCamera, captureTransform, Vector3(0.0f, 0.0f, 0.0f), face, 0.1f, 10.0f);
+        setEffectView(NULL_ENTITY, captureCamera, captureTransform);
+        sky.skyViewProjectionMatrix = getSkyViewProjection(captureCamera, 0.0f);
+        skyCapturePass.startRenderPass(&skyCaptureFramebuffer, (size_t)face);
+        drawSky(sky, PIP_RTT_INVERT);
+        skyCapturePass.endRenderPass();
+    }
+    capturingReflectionProbe = false;
+    sky.skyViewProjectionMatrix = viewProjection;
+
+    // a texture still loading left the faces undrawn
+    if (sky.needUpdateTexture)
+        return;
+
+    if (!skyCaptureIrradiance)
+        skyCaptureIrradiance = std::make_shared<TextureRender>();
+    if (!skyCapturePrefiltered)
+        skyCapturePrefiltered = std::make_shared<TextureRender>();
+    if (!filterEnvironment(skyCaptureFramebuffer.getColorTexture(), SKY_CAPTURE_SIZE, format, *skyCapturePrefiltered, skyCaptureIrradiance.get()))
+        return;
+
+    skyCaptureInputs = std::move(inputs);
+    skyCaptureElapsed = 0.0f;
+    sky.needUpdateEnvironment = false;
+    // the meshes drew with the IBL variant all along and bind the maps on each draw
+    if (sky.irradianceMap != skyCaptureIrradiance){
+        releaseSkyEnvironment(sky);
+        sky.irradianceMap = skyCaptureIrradiance;
+        sky.prefilteredMap = skyCapturePrefiltered;
+        sky.envMapsLoaded = true;
+    }
+}
+
+void RenderSystem::addSkyEnvironment(ObjectRender& render, ShaderData& shaderData){
+    TextureRender* irradiance = &emptyCubeBlack;
+    TextureRender* prefiltered = &emptyCubeBlack;
+    auto skys = scene->getComponentArray<SkyComponent>();
+    if (skys->size() > 0){
+        SkyComponent& sky = skys->getComponentFromIndex(0);
+        if (sky.irradianceMap && sky.prefilteredMap){
+            irradiance = sky.irradianceMap.get();
+            prefiltered = sky.prefilteredMap.get();
+        }
+    }
+    render.addTexture(shaderData.getTextureIndex(TextureShaderType::IRRADIANCEMAP), ShaderStageType::FRAGMENT, irradiance);
+    render.addTexture(shaderData.getTextureIndex(TextureShaderType::PREFILTEREDMAP), ShaderStageType::FRAGMENT, prefiltered);
+}
+
+void RenderSystem::destroySkyCapture(){
+    skyCaptureFramebuffer.destroyFramebuffer();
+    if (skyCaptureIrradiance)
+        skyCaptureIrradiance->destroyTexture();
+    if (skyCapturePrefiltered)
+        skyCapturePrefiltered->destroyTexture();
+    skyCaptureIrradiance.reset();
+    skyCapturePrefiltered.reset();
+    skyCaptureInputs.clear();
+}
+
 // generates (or regenerates) the IBL environment maps from the sky texture,
 // must run while the texture pixels are still on CPU (before the sky GPU upload)
 void RenderSystem::updateSkyEnvironment(SkyComponent& sky){
+    // a shader file's sky is captured in the draw
+    if (isSkyCaptured(sky))
+        return;
+
+    // the maps of a shader file the sky no longer has give way to the texture's
+    if (skyCaptureFramebuffer.isCreated()){
+        releaseSkyEnvironment(sky);
+        destroySkyCapture();
+        sky.needUpdateEnvironment = true;
+    }
+
     if (!sky.needUpdateEnvironment)
         return;
 
@@ -1847,7 +2038,7 @@ void RenderSystem::renderReflectionProbeCapture(){
     if (!runtime.captureFramebuffer.isCreated() || runtime.resolution != resolution){
         runtime.captureFramebuffer.destroyFramebuffer();
         if (!runtime.captureFramebuffer.createFramebuffer(TextureType::TEXTURE_CUBE, (int)resolution, (int)resolution,
-                TextureFilter::LINEAR, TextureFilter::LINEAR, TextureWrap::CLAMP_TO_EDGE, TextureWrap::CLAMP_TO_EDGE, false)){
+                TextureFilter::LINEAR, TextureFilter::LINEAR, TextureWrap::CLAMP_TO_EDGE, TextureWrap::CLAMP_TO_EDGE, false, environmentFormat())){
             return;
         }
         runtime.resolution = resolution;
@@ -1855,39 +2046,12 @@ void RenderSystem::renderReflectionProbeCapture(){
         runtime.ready = false;
     }
 
-    static const Vector3 directions[6] = {
-        Vector3(1, 0, 0), Vector3(-1, 0, 0), Vector3(0, 1, 0),
-        Vector3(0, -1, 0), Vector3(0, 0, 1), Vector3(0, 0, -1)
-    };
-    static const Vector3 ups[6] = {
-        Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, 1),
-        Vector3(0, 0, -1), Vector3(0, -1, 0), Vector3(0, -1, 0)
-    };
-
     int face = runtime.nextFace;
     Vector3 capturePosition = runtime.capturePosition;
 
     Transform captureTransform;
-    captureTransform.position = capturePosition;
-    captureTransform.worldPosition = capturePosition;
-    captureTransform.worldScale = Vector3(1.0f, 1.0f, 1.0f);
-    captureTransform.parent = NULL_ENTITY;
-
     CameraComponent captureCamera;
-    captureCamera.type = CameraType::CAMERA_PERSPECTIVE;
-    captureCamera.renderToTexture = true;
-    // cube faces flip on the opposite backends from 2D RTT (see
-    // isRenderingFlipped), so the matching winding is PIP_RTT_INVERT
-    captureCamera.invertCulling = true;
-    captureCamera.autoResize = false;
-    captureCamera.useTarget = true;
-    captureCamera.target = capturePosition + directions[face];
-    captureCamera.up = ups[face];
-    captureCamera.yfov = 1.57079632679f;
-    captureCamera.aspect = 1.0f;
-    captureCamera.nearClip = std::max(probe->nearClip, 0.001f);
-    captureCamera.farClip = std::max(probe->farClip, captureCamera.nearClip + 0.001f);
-    updateCamera(captureCamera, captureTransform);
+    setCaptureCamera(captureCamera, captureTransform, capturePosition, face, probe->nearClip, probe->farClip);
 
     const fs_lighting_t mainLighting = fs_lighting;
     fs_lighting.eyePos = Vector4(capturePosition.x, capturePosition.y, capturePosition.z, 1.0f);
@@ -1951,6 +2115,37 @@ void RenderSystem::renderReflectionProbeCapture(){
     }
 }
 
+void RenderSystem::setCaptureCamera(CameraComponent& camera, Transform& transform, const Vector3& position, int face, float nearClip, float farClip){
+    static const Vector3 directions[6] = {
+        Vector3(1, 0, 0), Vector3(-1, 0, 0), Vector3(0, 1, 0),
+        Vector3(0, -1, 0), Vector3(0, 0, 1), Vector3(0, 0, -1)
+    };
+    static const Vector3 ups[6] = {
+        Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, 1),
+        Vector3(0, 0, -1), Vector3(0, -1, 0), Vector3(0, -1, 0)
+    };
+
+    transform.position = position;
+    transform.worldPosition = position;
+    transform.worldScale = Vector3(1.0f, 1.0f, 1.0f);
+    transform.parent = NULL_ENTITY;
+
+    camera.type = CameraType::CAMERA_PERSPECTIVE;
+    camera.renderToTexture = true;
+    // cube faces flip on the opposite backends from 2D RTT (see
+    // isRenderingFlipped), so the matching winding is PIP_RTT_INVERT
+    camera.invertCulling = true;
+    camera.autoResize = false;
+    camera.useTarget = true;
+    camera.target = position + directions[face];
+    camera.up = ups[face];
+    camera.yfov = 1.57079632679f;
+    camera.aspect = 1.0f;
+    camera.nearClip = std::max(nearClip, 0.001f);
+    camera.farClip = std::max(farClip, camera.nearClip + 0.001f);
+    updateCamera(camera, transform);
+}
+
 void RenderSystem::loadProbeFilter(){
     if (probeFilterLoaded)
         return;
@@ -1986,8 +2181,6 @@ void RenderSystem::destroyProbeFilter(){
     probeFilterLoaded = false;
 }
 
-// Prefilters the finished captures like IBLEnvironment does the sky: a box mip chain of
-// the capture, then one GGX roughness per level sampled from it.
 void RenderSystem::filterReflectionProbes(){
     for (auto& entry : reflectionProbeRuntimes){
         ReflectionProbeRuntime& runtime = *entry.second;
@@ -1998,70 +2191,94 @@ void RenderSystem::filterReflectionProbes(){
         if (!probeFilterLoaded)
             return;
 
-        const int size = IBLEnvironment::SPECULAR_BASE_SIZE;
-        const int levels = IBLEnvironment::SPECULAR_MIPS;
-        const int captureSize = (int)runtime.resolution;
-        // like IBLEnvironment, the chain starts no larger than the prefiltered map
-        const int sourceSize = std::min(captureSize, size);
-        int sourceLevels = 1;
-        while ((sourceSize >> sourceLevels) > 0)
-            sourceLevels++;
-        auto createMap = [](TextureRender& map, int mapSize, int mapLevels){
-            return map.createFramebufferTexture(TextureType::TEXTURE_CUBE, false, false, mapSize, mapSize,
-                    TextureFilter::LINEAR_MIPMAP_LINEAR, TextureFilter::LINEAR, TextureWrap::CLAMP_TO_EDGE, TextureWrap::CLAMP_TO_EDGE,
-                    ColorFormat::RGBA, mapLevels);
-        };
-        if (!probeSourceMap.isCreated() || probeSourceSize != sourceSize){
-            probeSourceMap.destroyTexture();
-            probeReduceMap.destroyTexture();
-            if (!createMap(probeSourceMap, sourceSize, sourceLevels) || !createMap(probeReduceMap, sourceSize, sourceLevels))
-                continue;
-            probeSourceSize = sourceSize;
-        }
-        if (!runtime.filteredMap.isCreated() && !createMap(runtime.filteredMap, size, levels))
-            continue;
-
-        ShaderData& sd = probeFilterShader.get()->shaderData;
-        auto filterPass = [&](TextureRender& target, TextureRender& source, int level, int face){
-            probeFilterPassRender.startRenderPass(&target, (size_t)face, level);
-            if (probeFilterRender.beginDraw(PIP_RTT_COLORONLY)){
-                probeFilterRender.addTexture(sd.getTextureIndex(TextureShaderType::PROBESOURCE), ShaderStageType::FRAGMENT, &source);
-                probeFilterRender.applyUniformBlock(probeFilterSlotParams, sizeof(fs_probe_filter_t), &fs_probe_filter);
-                probeFilterRender.draw(0, 3, 1);
-            }
-            probeFilterPassRender.endRenderPass();
-        };
-
-        auto downsampleLevel = [&](TextureRender& target, TextureRender& source, int level, int sourceLevel, int sourceBaseSize){
-            const int levelSize = sourceSize >> level;
-            const int sourceLevelSize = sourceBaseSize >> sourceLevel;
-            const float taps = (float)std::min(16, (sourceLevelSize + levelSize - 1) / levelSize);
-            for (int face = 0; face < 6; face++){
-                fs_probe_filter.params = Vector4(0.0f, (float)face, taps, 1.0f);
-                fs_probe_filter.source = Vector4((float)levelSize, (float)sourceBaseSize, 1.0f, (float)sourceLevel);
-                filterPass(target, source, level, face);
-            }
-        };
-
-        // each level is a 2x2 box of the one above, reduced into probeReduceMap and
-        // copied back, as a pass can't sample the texture it renders to
-        downsampleLevel(probeSourceMap, runtime.captureFramebuffer.getColorTexture(), 0, 0, captureSize);
-        for (int level = 1; level < sourceLevels; level++){
-            downsampleLevel(probeReduceMap, probeSourceMap, level, level - 1, sourceSize);
-            downsampleLevel(probeSourceMap, probeReduceMap, level, level, sourceSize);
-        }
-
-        for (int level = 0; level < levels; level++){
-            const float roughness = (float)level / (float)(levels - 1);
-            for (int face = 0; face < 6; face++){
-                fs_probe_filter.params = Vector4(roughness, (float)face, 64.0f, 0.0f);
-                fs_probe_filter.source = Vector4((float)(size >> level), (float)sourceSize, (float)sourceLevels, 0.0f);
-                filterPass(runtime.filteredMap, probeSourceMap, level, face);
-            }
-        }
-
-        runtime.needFilter = false;
+        if (filterEnvironment(runtime.captureFramebuffer.getColorTexture(), (int)runtime.resolution, environmentFormat(), runtime.filteredMap, nullptr))
+            runtime.needFilter = false;
     }
+}
+
+// Prefilters a capture like IBLEnvironment does a sky texture: a box mip chain of it,
+// then one GGX roughness per level sampled from it, and the irradiance from the same chain.
+bool RenderSystem::filterEnvironment(TextureRender& capture, int captureSize, ColorFormat format, TextureRender& prefiltered, TextureRender* irradiance){
+    loadProbeFilter();
+    if (!probeFilterLoaded)
+        return false;
+
+    const int size = IBLEnvironment::SPECULAR_BASE_SIZE;
+    const int levels = IBLEnvironment::SPECULAR_MIPS;
+    // like IBLEnvironment, the chain starts no larger than the prefiltered map
+    const int sourceSize = std::min(captureSize, size);
+    int sourceLevels = 1;
+    while ((sourceSize >> sourceLevels) > 0)
+        sourceLevels++;
+    // in the capture's format, kept when it already is
+    auto createMap = [format](TextureRender& map, int mapSize, int mapLevels){
+        if (map.isCreated() && map.getColorFormat() == format)
+            return true;
+        map.destroyTexture();
+        return map.createFramebufferTexture(TextureType::TEXTURE_CUBE, false, false, mapSize, mapSize,
+                mapLevels > 1 ? TextureFilter::LINEAR_MIPMAP_LINEAR : TextureFilter::LINEAR, TextureFilter::LINEAR,
+                TextureWrap::CLAMP_TO_EDGE, TextureWrap::CLAMP_TO_EDGE, format, mapLevels);
+    };
+    if (!probeSourceMap.isCreated() || probeSourceSize != sourceSize || probeSourceMap.getColorFormat() != format){
+        probeSourceMap.destroyTexture();
+        probeReduceMap.destroyTexture();
+        if (!createMap(probeSourceMap, sourceSize, sourceLevels) || !createMap(probeReduceMap, sourceSize, sourceLevels))
+            return false;
+        probeSourceSize = sourceSize;
+    }
+    if (!createMap(prefiltered, size, levels))
+        return false;
+    if (irradiance && !createMap(*irradiance, IBLEnvironment::IRRADIANCE_SIZE, 1))
+        return false;
+
+    ShaderData& sd = probeFilterShader.get()->shaderData;
+    auto filterPass = [&](TextureRender& target, TextureRender& source, int level, int face){
+        probeFilterPassRender.startRenderPass(&target, (size_t)face, level);
+        if (probeFilterRender.beginDraw(PIP_RTT_COLORONLY)){
+            probeFilterRender.addTexture(sd.getTextureIndex(TextureShaderType::PROBESOURCE), ShaderStageType::FRAGMENT, &source);
+            probeFilterRender.applyUniformBlock(probeFilterSlotParams, sizeof(fs_probe_filter_t), &fs_probe_filter);
+            probeFilterRender.draw(0, 3, 1);
+        }
+        probeFilterPassRender.endRenderPass();
+    };
+
+    auto downsampleLevel = [&](TextureRender& target, TextureRender& source, int level, int sourceLevel, int sourceBaseSize){
+        const int levelSize = sourceSize >> level;
+        const int sourceLevelSize = sourceBaseSize >> sourceLevel;
+        const float taps = (float)std::min(16, (sourceLevelSize + levelSize - 1) / levelSize);
+        for (int face = 0; face < 6; face++){
+            fs_probe_filter.params = Vector4(0.0f, (float)face, taps, 1.0f);
+            fs_probe_filter.source = Vector4((float)levelSize, (float)sourceBaseSize, 1.0f, (float)sourceLevel);
+            filterPass(target, source, level, face);
+        }
+    };
+
+    // each level is a 2x2 box of the one above, reduced into probeReduceMap and
+    // copied back, as a pass can't sample the texture it renders to
+    downsampleLevel(probeSourceMap, capture, 0, 0, captureSize);
+    for (int level = 1; level < sourceLevels; level++){
+        downsampleLevel(probeReduceMap, probeSourceMap, level, level - 1, sourceSize);
+        downsampleLevel(probeSourceMap, probeReduceMap, level, level, sourceSize);
+    }
+
+    for (int level = 0; level < levels; level++){
+        const float roughness = (float)level / (float)(levels - 1);
+        for (int face = 0; face < 6; face++){
+            fs_probe_filter.params = Vector4(roughness, (float)face, 64.0f, 0.0f);
+            fs_probe_filter.source = Vector4((float)(size >> level), (float)sourceSize, (float)sourceLevels, 0.0f);
+            filterPass(prefiltered, probeSourceMap, level, face);
+        }
+    }
+
+    if (irradiance){
+        for (int face = 0; face < 6; face++){
+            fs_probe_filter.params = Vector4(0.0f, (float)face, 128.0f, 2.0f);
+            fs_probe_filter.source = Vector4((float)IBLEnvironment::IRRADIANCE_SIZE, (float)sourceSize, (float)sourceLevels, 0.0f);
+            filterPass(*irradiance, probeSourceMap, 0, face);
+        }
+    }
+
+    return true;
 }
 
 void RenderSystem::initShadowAtlasRects(){
@@ -3133,11 +3350,11 @@ RenderSystem::SceneShading RenderSystem::getAuthoredSceneShading() const{
     // the project draws the fog the editor can hide
     shading.fog = scene->getComponentArray<FogComponent>()->size() > 0;
 
-    // as updateSkyEnvironment, which makes the maps of a cube sky
+    // as updateSkyEnvironment, which makes the maps of a cube sky, and captureSky those of a shader sky
     auto skys = scene->getComponentArray<SkyComponent>();
     if (skys->size() > 0){
-        const Texture& sky = skys->getComponentFromIndex(0).texture;
-        shading.ibl = !sky.empty() && sky.getNumFaces() == 6;
+        const SkyComponent& sky = skys->getComponentFromIndex(0);
+        shading.ibl = isSkyCaptured(sky) || (!sky.texture.empty() && sky.texture.getNumFaces() == 6);
     }
     shading.reflectionProbes = scene->getComponentArray<ReflectionProbeComponent>()->size() > 0;
 
@@ -3626,18 +3843,7 @@ bool RenderSystem::loadMesh(Entity entity, MeshComponent& mesh, uint16_t pipelin
         loadShadow2DTexture(shaderData, mesh.submeshes[i].render, sh.shadows2d);
 
         if (sh.ibl){
-            auto skyArray = scene->getComponentArray<SkyComponent>();
-            TextureRender* irradiance = &emptyCubeBlack;
-            TextureRender* prefiltered = &emptyCubeBlack;
-            if (skyArray->size() > 0){
-                SkyComponent& sky = skyArray->getComponentFromIndex(0);
-                if (sky.irradianceMap && sky.prefilteredMap){
-                    irradiance = sky.irradianceMap.get();
-                    prefiltered = sky.prefilteredMap.get();
-                }
-            }
-            render.addTexture(shaderData.getTextureIndex(TextureShaderType::IRRADIANCEMAP), ShaderStageType::FRAGMENT, irradiance);
-            render.addTexture(shaderData.getTextureIndex(TextureShaderType::PREFILTEREDMAP), ShaderStageType::FRAGMENT, prefiltered);
+            addSkyEnvironment(render, shaderData);
             render.addTexture(shaderData.getTextureIndex(TextureShaderType::REFLECTIONPROBE), ShaderStageType::FRAGMENT, &emptyCubeBlack);
         }
 
@@ -4247,7 +4453,7 @@ void RenderSystem::updateMeshLodErrors(MeshComponent& mesh){
 void RenderSystem::updateMainLodView(CameraComponent& camera, Transform& cameraTransform){
     float viewHeight = Engine::getViewRect().getHeight();
     if (isFixedResolutionActive())
-        viewHeight = (float)scene->getFixedResolutionHeight();
+        viewHeight = (float)fixedResHeight;
     viewHeight = std::max(viewHeight, 1.0f);
 
     LodView view;
@@ -5220,6 +5426,7 @@ bool RenderSystem::drawMesh(Entity entity, MeshComponent& mesh, Transform& trans
                 Vector3 probeSamplePosition = meshProbeSamplePosition(mesh, transform);
                 selectReflectionProbe(probeSamplePosition, fs_reflection_probe, probeTexture);
                 ShaderData& probeShaderData = mesh.submeshes[i].shader.get()->shaderData;
+                addSkyEnvironment(render, probeShaderData);
                 render.addTexture(probeShaderData.getTextureIndex(TextureShaderType::REFLECTIONPROBE), ShaderStageType::FRAGMENT, probeTexture);
                 if (mesh.submeshes[i].slotFSReflectionProbe != -1){
                     render.applyUniformBlock(mesh.submeshes[i].slotFSReflectionProbe, sizeof(fs_reflection_probe_t), &fs_reflection_probe);
@@ -5612,8 +5819,8 @@ void RenderSystem::renderSSAO(CameraComponent& camera, TextureRender* sharedDept
     if (isFixedResolutionActive() && !camera.renderToTexture){
         // the main color pass renders into the fixed-resolution target, so the
         // AO buffer must match it (meshes convert gl_FragCoord with these sizes)
-        w = scene->getFixedResolutionWidth();
-        h = scene->getFixedResolutionHeight();
+        w = fixedResWidth;
+        h = fixedResHeight;
     }
     if (!ensureSSAOFramebuffers(w, h))
         return;
@@ -6011,10 +6218,13 @@ bool RenderSystem::ensureSceneColorFramebuffer(unsigned int width, unsigned int 
     if (width == 0 || height == 0)
         return false;
 
-    if (sceneColorFramebuffer.isCreated() && sceneColorFramebuffer.getWidth() == width && sceneColorFramebuffer.getHeight() == height)
+    const ColorFormat format = getSceneColorFormat();
+    if (sceneColorFramebuffer.isCreated() && sceneColorFramebuffer.getWidth() == width && sceneColorFramebuffer.getHeight() == height &&
+            sceneColorFramebuffer.getColorFormat() == format)
         return true;
 
     sceneColorFramebuffer.destroy();
+    sceneColorFramebuffer.setColorAttachments(1, &format);
 
     // offscreen opaque scene color (sampled bilinearly by ssr.frag); has a depth
     // attachment so the redirected main color pass can depth-test normally.
@@ -6033,13 +6243,17 @@ bool RenderSystem::ensureSSRFramebuffers(unsigned int width, unsigned int height
     if (!ensureSceneColorFramebuffer(width, height))
         return false;
 
-    if (ssrFramebuffer.isCreated() && ssrBlurFramebuffer.isCreated() && ssrWidth == width && ssrHeight == height)
+    // float with HDR, so bright reflections reach the tone curve
+    const ColorFormat format = getSceneColorFormat();
+    if (ssrFramebuffer.isCreated() && ssrBlurFramebuffer.isCreated() && ssrWidth == width && ssrHeight == height &&
+            ssrFramebuffer.getColorFormat() == format)
         return true;
 
     ssrFramebuffer.destroy();
     ssrBlurFramebuffer.destroy();
 
     // reflection color + mask
+    ssrFramebuffer.setColorAttachments(1, &format);
     ssrFramebuffer.setWidth(width);
     ssrFramebuffer.setHeight(height);
     ssrFramebuffer.setMinFilter(TextureFilter::LINEAR);
@@ -6049,6 +6263,7 @@ bool RenderSystem::ensureSSRFramebuffers(unsigned int width, unsigned int height
     ssrFramebuffer.create();
 
     // glossy-blurred reflection (sampled by the composite when blur > 0)
+    ssrBlurFramebuffer.setColorAttachments(1, &format);
     ssrBlurFramebuffer.setWidth(width);
     ssrBlurFramebuffer.setHeight(height);
     ssrBlurFramebuffer.setMinFilter(TextureFilter::LINEAR);
@@ -6143,8 +6358,7 @@ void RenderSystem::renderSSR(CameraComponent& camera, FramebufferRender* destina
             SkyComponent& sky = skys->getComponentFromIndex(0);
             if (sky.prefilteredMap){
                 prefilteredTexture = sky.prefilteredMap.get();
-                Vector3 linColor = Color::sRGBToLinear(Vector3(sky.color.x, sky.color.y, sky.color.z));
-                fs_composite.envColor = Vector4(linColor.x, linColor.y, linColor.z, Angle::defaultToRad(sky.rotation));
+                fs_composite.envColor = getSkyEnvironment(sky);
             }
         }
     }
@@ -6152,7 +6366,7 @@ void RenderSystem::renderSSR(CameraComponent& camera, FramebufferRender* destina
     ssrPassRender.setClearColor(scene->getBackgroundColor());
     PipelineType compositePip;
     if (destination){
-        ssrPassRender.startRenderPass(destination);
+        startFullscreenPass(ssrPassRender, destination);
         compositePip = PIP_RTT;
     }else{
         ssrPassRender.startRenderPass();
@@ -6189,13 +6403,11 @@ void RenderSystem::loadBlit(){
     if (!blitShader || !blitShader->isCreated())
         return;
 
-    // the blit targets either an offscreen framebuffer (PIP_RTT) or the swapchain
-    // (PIP_DEFAULT, exported builds); PIP_RTT_NODEPTH copies into a camera pass in progress
-    // and PIP_RTT_NOBLEND into the scene copy
+    // copies replace their target, offscreen or the swapchain; PIP_RTT_NODEPTH draws into a camera pass in progress
     blitRender.beginLoad(PrimitiveType::TRIANGLES);
     blitRender.setShader(blitShader.get());
     blitSlotParams = blitShader.get()->shaderData.getUniformBlockIndex(UniformBlockType::BLIT_FS_PARAMS);
-    if (!blitRender.endLoad(PIP_RTT | PIP_DEFAULT | PIP_RTT_NODEPTH | PIP_RTT_NOBLEND, false, true, CullingMode::BACK, WindingOrder::CCW))
+    if (!blitRender.endLoad(PIP_RTT_NOBLEND | PIP_DEFAULT_NOBLEND | PIP_RTT_NODEPTH, false, true, CullingMode::BACK, WindingOrder::CCW))
         return;
 
     blitLoaded = true;
@@ -6245,6 +6457,14 @@ bool RenderSystem::ensureFixedResFramebuffer(unsigned int width, unsigned int he
     return fixedResFramebuffer.isCreated();
 }
 
+void RenderSystem::startFullscreenPass(CameraRender& passRender, FramebufferRender* target){
+    passRender.setClearColor(scene->getBackgroundColor());
+    passRender.startRenderPass(target);
+    if (Engine::getFramebuffer() && target == &Engine::getFramebuffer()->getRender()){
+        passRender.applyViewport(Engine::getViewRect());
+    }
+}
+
 void RenderSystem::renderBlit(TextureRender* source, FramebufferRender* destination, const Rect* viewport){
     // bars outside the viewport keep the background color (same as the direct
     // path, which clears the whole destination before applying the viewport)
@@ -6261,7 +6481,7 @@ void RenderSystem::renderBlit(TextureRender* source, FramebufferRender* destinat
     }
 
     // the source was rendered flipped (PIP_RTT) but the GL swapchain is not
-    drawBlit(source, destination ? PIP_RTT : PIP_DEFAULT, !destination && Engine::isOpenGL());
+    drawBlit(source, destination ? PIP_RTT_NOBLEND : PIP_DEFAULT_NOBLEND, !destination && Engine::isOpenGL());
     blitPassRender.endRenderPass();
 }
 
@@ -6291,10 +6511,13 @@ bool RenderSystem::ensureSceneCopyFramebuffer(unsigned int width, unsigned int h
     if (width == 0 || height == 0)
         return false;
 
-    if (sceneCopyFramebuffer.isCreated() && sceneCopyFramebuffer.getWidth() == width && sceneCopyFramebuffer.getHeight() == height)
+    const ColorFormat format = getSceneColorFormat();
+    if (sceneCopyFramebuffer.isCreated() && sceneCopyFramebuffer.getWidth() == width && sceneCopyFramebuffer.getHeight() == height &&
+            sceneCopyFramebuffer.getColorFormat() == format)
         return true;
 
     sceneCopyFramebuffer.destroy();
+    sceneCopyFramebuffer.setColorAttachments(1, &format);
     sceneCopyFramebuffer.setWidth(width);
     sceneCopyFramebuffer.setHeight(height);
     sceneCopyFramebuffer.setMinFilter(TextureFilter::LINEAR);
@@ -6377,7 +6600,7 @@ void RenderSystem::loadPostProcess(){
         if (!loadShaderTextures(pass.textures, sd, pass.render))
             return;
         // the chain never targets the swapchain directly, renderPostProcess blits for that
-        if (!pass.render.endLoad(PIP_RTT, false, true, CullingMode::BACK, WindingOrder::CCW))
+        if (!pass.render.endLoad(PIP_RTT_NOBLEND, false, true, CullingMode::BACK, WindingOrder::CCW))
             return;
 
         pass.slotSceneColor = sd.getTextureIndexByName("u_sceneColorTexture");
@@ -6405,7 +6628,8 @@ void RenderSystem::loadPostProcess(){
 
 // rewrites the pass values from the scene chain, keeping the compiled shaders
 void RenderSystem::updatePostProcessUniforms(){
-    if (!postProcessNeedUpdateUniforms || !postProcessLoaded)
+    // a pending reload rewrites them all, and the scene indices may have moved
+    if (!postProcessNeedUpdateUniforms || !postProcessLoaded || postProcessNeedReload)
         return;
 
     const std::vector<PostProcessPass>& passes = scene->getPostProcessPasses();
@@ -6444,12 +6668,15 @@ bool RenderSystem::ensurePostProcessFramebuffers(unsigned int width, unsigned in
     if (width == 0 || height == 0)
         return false;
 
-    if (postProcessFramebuffer[0].isCreated() && postProcessWidth == width && postProcessHeight == height)
+    const ColorFormat format = getSceneColorFormat();
+    if (postProcessFramebuffer[0].isCreated() && postProcessWidth == width && postProcessHeight == height &&
+            postProcessFramebuffer[0].getColorFormat() == format)
         return true;
 
     // the chain ping-pongs between the two; its last pass writes the real destination
     for (int i = 0; i < 2; i++){
         postProcessFramebuffer[i].destroy();
+        postProcessFramebuffer[i].setColorAttachments(1, &format);
         postProcessFramebuffer[i].setWidth(width);
         postProcessFramebuffer[i].setHeight(height);
         postProcessFramebuffer[i].setMinFilter(TextureFilter::LINEAR);
@@ -6465,20 +6692,36 @@ bool RenderSystem::ensurePostProcessFramebuffers(unsigned int width, unsigned in
     return postProcessFramebuffer[0].isCreated() && postProcessFramebuffer[1].isCreated();
 }
 
-void RenderSystem::renderPostProcess(FramebufferRender* destination){
-    // depth is the SSR G-buffer or the chain's own pre-pass; the G-buffer
-    // normal/roughness only exists while SSR is on
-    TextureRender* depthTexture = &emptyBlack;
+bool RenderSystem::preparePostProcess(unsigned int width, unsigned int height, bool& bloom, bool& toneMapping){
+    const bool wantsBloom = scene->isBloomEnabled();
+    const bool wantsToneMapping = needsToneMapping();
+    if (wantsBloom){
+        loadBloom();
+    }
+    if (wantsToneMapping){
+        loadToneMapping();
+    }
+
+    const bool runsPasses = postProcessLoaded && !postProcessPasses.empty();
+    const bool bloomReady = wantsBloom && bloomLoaded;
+    const bool toneMappingReady = wantsToneMapping && toneMappingLoaded;
+    bloom = false;
+    toneMapping = false;
+    if (!(runsPasses || bloomReady || toneMappingReady) || !ensurePostProcessFramebuffers(width, height))
+        return false;
+
+    // a view too small to halve has no bloom levels
+    bloom = bloomReady && ensureBloomFramebuffers(width, height);
+    toneMapping = toneMappingReady;
+    return runsPasses || bloom || toneMapping;
+}
+
+void RenderSystem::renderPostProcess(FramebufferRender* destination, bool bloom, bool toneMapping){
+    // depth of this frame; the G-buffer normal only exists while SSR is on
+    TextureRender* depthTexture = currentSceneDepthTexture ? currentSceneDepthTexture : &emptyBlack;
     TextureRender* gbufferTexture = &emptyBlack;
     if (postProcessNeedsGBuffer && gbufferFramebuffer.isCreated()){
         gbufferTexture = &gbufferFramebuffer.getRender().getColorAttachmentTexture(1);
-    }
-    if (postProcessNeedsDepth){
-        if (gbufferFramebuffer.isCreated()){
-            depthTexture = &gbufferFramebuffer.getRender().getColorAttachmentTexture(0);
-        }else if (ssaoDepthFramebuffer.isCreated()){
-            depthTexture = &ssaoDepthFramebuffer.getRender().getColorTexture();
-        }
     }
     TextureRender* ssaoTexture = currentSSAOTexture ? currentSSAOTexture : &emptyWhite;
 
@@ -6486,19 +6729,41 @@ void RenderSystem::renderPostProcess(FramebufferRender* destination){
     TextureRender* input = &postProcessFramebuffer[0].getRender().getColorTexture();
     int pingPong = 1;
 
+    // the engine stages run alone while the user passes are still loading
+    const int passCount = postProcessLoaded ? (int)postProcessPasses.size() : 0;
+    int stagesLeft = (bloom ? 1 : 0) + (toneMapping ? 1 : 0) + passCount;
+
+    // the last stage writes the destination, the others the next buffer
+    auto nextTarget = [&](){
+        return (destination && --stagesLeft == 0) ? destination : &postProcessFramebuffer[pingPong].getRender();
+    };
+    auto advance = [&](FramebufferRender* target){
+        if (target != destination){
+            input = &target->getColorTexture();
+            pingPong = 1 - pingPong;
+        }
+    };
+
+    if (bloom){
+        FramebufferRender* target = nextTarget();
+        renderBloom(input, target);
+        advance(target);
+    }
+
+    if (toneMapping){
+        FramebufferRender* target = nextTarget();
+        renderToneMapping(input, target);
+        advance(target);
+    }
+
     updatePostProcessUniforms();
 
-    for (int i = 0; i < (int)postProcessPasses.size(); i++){
+    for (int i = 0; i < passCount; i++){
         PostProcessRuntime& pass = postProcessPasses[i];
-        bool writeDestination = destination && (i + 1 == (int)postProcessPasses.size());
+        FramebufferRender* target = nextTarget();
 
-        if (writeDestination){
-            postProcessPassRender.startRenderPass(destination);
-        }else{
-            postProcessPassRender.startRenderPass(&postProcessFramebuffer[pingPong].getRender());
-        }
-
-        if (pass.render.beginDraw(PIP_RTT)){
+        startFullscreenPass(postProcessPassRender, target);
+        if (pass.render.beginDraw(PIP_RTT_NOBLEND)){
             if (ShaderTextures::isFramebufferOutdated(pass.textures))
                 loadShaderTextures(pass.textures, pass.shader.get()->shaderData, pass.render);
             pass.render.addTexture(pass.slotSceneColor, ShaderStageType::FRAGMENT, input);
@@ -6512,10 +6777,7 @@ void RenderSystem::renderPostProcess(FramebufferRender* destination){
         }
         postProcessPassRender.endRenderPass();
 
-        if (!writeDestination){
-            input = &postProcessFramebuffer[pingPong].getRender().getColorTexture();
-            pingPong = 1 - pingPong;
-        }
+        advance(target);
     }
 
     // the swapchain is written by the blit pass, which handles the GL orientation flip
@@ -6523,6 +6785,223 @@ void RenderSystem::renderPostProcess(FramebufferRender* destination){
         const Rect viewport = Engine::getViewRect();
         renderBlit(input, nullptr, &viewport);
     }
+}
+
+void RenderSystem::loadBloom(){
+    if (bloomLoaded)
+        return;
+
+    // the shaders may still be building (async in the editor)
+    bloomDownShader = ShaderPool::get(ShaderType::BLOOM_DOWNSAMPLE, 0);
+    bloomUpShader = ShaderPool::get(ShaderType::BLOOM_UPSAMPLE, 0);
+    if (!bloomDownShader || !bloomDownShader->isCreated() || !bloomUpShader || !bloomUpShader->isCreated())
+        return;
+
+    bloomDownRender.beginLoad(PrimitiveType::TRIANGLES);
+    bloomDownRender.setShader(bloomDownShader.get());
+    bloomDownSlotParams = bloomDownShader.get()->shaderData.getUniformBlockIndex(UniformBlockType::BLOOM_DOWNSAMPLE_FS_PARAMS);
+    if (!bloomDownRender.endLoad(PIP_RTT_NOBLEND, false, true, CullingMode::BACK, WindingOrder::CCW))
+        return;
+
+    bloomUpRender.beginLoad(PrimitiveType::TRIANGLES);
+    bloomUpRender.setShader(bloomUpShader.get());
+    bloomUpSlotParams = bloomUpShader.get()->shaderData.getUniformBlockIndex(UniformBlockType::BLOOM_UPSAMPLE_FS_PARAMS);
+    if (!bloomUpRender.endLoad(PIP_RTT_NOBLEND, false, true, CullingMode::BACK, WindingOrder::CCW))
+        return;
+
+    bloomLoaded = true;
+}
+
+void RenderSystem::destroyBloom(){
+    if (bloomLoaded){
+        bloomDownRender.destroy();
+        bloomUpRender.destroy();
+    }
+    if (bloomDownShader){
+        bloomDownShader.reset();
+        ShaderPool::remove(ShaderType::BLOOM_DOWNSAMPLE, 0);
+    }
+    if (bloomUpShader){
+        bloomUpShader.reset();
+        ShaderPool::remove(ShaderType::BLOOM_UPSAMPLE, 0);
+    }
+
+    destroyBloomFramebuffers();
+
+    bloomDownSlotParams = -1;
+    bloomUpSlotParams = -1;
+    bloomLoaded = false;
+}
+
+bool RenderSystem::ensureBloomFramebuffers(unsigned int width, unsigned int height){
+    if (width < 4 || height < 4)
+        return false;
+
+    const ColorFormat format = getSceneColorFormat();
+    if (bloomLevels > 0 && bloomWidth == width && bloomHeight == height && bloomDownFramebuffer[0].getColorFormat() == format)
+        return true;
+
+    destroyBloomFramebuffers();
+
+    // halving down to a level about 8 pixels high keeps the glow the same share of any view
+    int levels = 1;
+    const unsigned int shortSide = std::min(width, height);
+    while (levels < BLOOM_MAX_LEVELS && (shortSide >> (levels + 1)) >= 8)
+        levels++;
+
+    auto createLevel = [&format](Framebuffer& framebuffer, unsigned int levelWidth, unsigned int levelHeight){
+        framebuffer.setColorAttachments(1, &format);
+        framebuffer.setWidth(levelWidth);
+        framebuffer.setHeight(levelHeight);
+        framebuffer.setMinFilter(TextureFilter::LINEAR);
+        framebuffer.setMagFilter(TextureFilter::LINEAR);
+        framebuffer.setWrapU(TextureWrap::CLAMP_TO_EDGE);
+        framebuffer.setWrapV(TextureWrap::CLAMP_TO_EDGE);
+        framebuffer.create();
+        return framebuffer.isCreated();
+    };
+
+    for (int i = 0; i < levels; i++){
+        const unsigned int levelWidth = std::max(1u, width >> (i + 1));
+        const unsigned int levelHeight = std::max(1u, height >> (i + 1));
+        // the way back up has no target at the smallest level
+        if (!createLevel(bloomDownFramebuffer[i], levelWidth, levelHeight) ||
+                (i + 1 < levels && !createLevel(bloomUpFramebuffer[i], levelWidth, levelHeight))){
+            destroyBloomFramebuffers();
+            return false;
+        }
+    }
+
+    bloomLevels = levels;
+    bloomWidth = width;
+    bloomHeight = height;
+
+    return true;
+}
+
+void RenderSystem::destroyBloomFramebuffers(){
+    for (int i = 0; i < BLOOM_MAX_LEVELS; i++){
+        bloomDownFramebuffer[i].destroy();
+        bloomUpFramebuffer[i].destroy();
+    }
+    bloomLevels = 0;
+    bloomWidth = 0;
+    bloomHeight = 0;
+}
+
+void RenderSystem::renderBloom(TextureRender* source, FramebufferRender* destination){
+    const float threshold = std::max(scene->getBloomThreshold(), 0.0f);
+    const float knee = threshold * std::clamp(scene->getBloomKnee(), 0.0f, 1.0f);
+    ShaderData& downData = bloomDownShader.get()->shaderData;
+    ShaderData& upData = bloomUpShader.get()->shaderData;
+    const std::pair<int, int> downSource = downData.getTextureIndex(TextureShaderType::SCENECOLORTEXTURE);
+    const std::pair<int, int> upSource = upData.getTextureIndex(TextureShaderType::SCENECOLORTEXTURE);
+    const std::pair<int, int> upBase = upData.getTextureIndex(TextureShaderType::BLOOMTEXTURE);
+
+    // down the chain, each level half the size of the one before
+    TextureRender* input = source;
+    Vector2 texel(1.0f / (float)bloomWidth, 1.0f / (float)bloomHeight);
+    for (int i = 0; i < bloomLevels; i++){
+        fs_bloom_down.params = Vector4(texel.x, texel.y, i == 0 ? 1.0f : 0.0f, 0.0f);
+        fs_bloom_down.threshold = Vector4(threshold, knee, 0.0f, 0.0f);
+        startFullscreenPass(bloomPassRender, &bloomDownFramebuffer[i].getRender());
+        if (bloomDownRender.beginDraw(PIP_RTT_NOBLEND)){
+            bloomDownRender.addTexture(downSource, ShaderStageType::FRAGMENT, input);
+            bloomDownRender.applyUniformBlock(bloomDownSlotParams, sizeof(fs_bloom_down_t), &fs_bloom_down);
+            bloomDownRender.draw(0, 3, 1);
+        }
+        bloomPassRender.endRenderPass();
+        input = &bloomDownFramebuffer[i].getRender().getColorTexture();
+        texel = Vector2(1.0f / (float)bloomDownFramebuffer[i].getWidth(), 1.0f / (float)bloomDownFramebuffer[i].getHeight());
+    }
+
+    // back up, each level spreading the smaller one over its own
+    const float spread = std::clamp(scene->getBloomRadius(), 0.0f, 1.0f);
+    for (int i = bloomLevels - 2; i >= 0; i--){
+        fs_bloom_up.params = Vector4(texel.x, texel.y, spread, 0.0f);
+        startFullscreenPass(bloomPassRender, &bloomUpFramebuffer[i].getRender());
+        if (bloomUpRender.beginDraw(PIP_RTT_NOBLEND)){
+            bloomUpRender.addTexture(upSource, ShaderStageType::FRAGMENT, input);
+            bloomUpRender.addTexture(upBase, ShaderStageType::FRAGMENT, &bloomDownFramebuffer[i].getRender().getColorTexture());
+            bloomUpRender.applyUniformBlock(bloomUpSlotParams, sizeof(fs_bloom_up_t), &fs_bloom_up);
+            bloomUpRender.draw(0, 3, 1);
+        }
+        bloomPassRender.endRenderPass();
+        input = &bloomUpFramebuffer[i].getRender().getColorTexture();
+        texel = Vector2(1.0f / (float)bloomUpFramebuffer[i].getWidth(), 1.0f / (float)bloomUpFramebuffer[i].getHeight());
+    }
+
+    // the glow over the scene
+    fs_bloom_up.params = Vector4(texel.x, texel.y, std::max(scene->getBloomIntensity(), 0.0f), 1.0f);
+    startFullscreenPass(bloomPassRender, destination);
+    if (bloomUpRender.beginDraw(PIP_RTT_NOBLEND)){
+        bloomUpRender.addTexture(upSource, ShaderStageType::FRAGMENT, input);
+        bloomUpRender.addTexture(upBase, ShaderStageType::FRAGMENT, source);
+        bloomUpRender.applyUniformBlock(bloomUpSlotParams, sizeof(fs_bloom_up_t), &fs_bloom_up);
+        bloomUpRender.draw(0, 3, 1);
+    }
+    bloomPassRender.endRenderPass();
+}
+
+bool RenderSystem::isHDRActive() const{
+    return scene->isHDREnabled() && FramebufferRender::isColorFormatSupported(ColorFormat::RGBA16F);
+}
+
+bool RenderSystem::wantsPostProcess(const CameraComponent& camera) const{
+    return (scene->isBloomEnabled() || needsToneMapping() || !scene->getPostProcessPasses().empty()) &&
+        (Engine::getMainScene() == scene || camera.renderToTexture);
+}
+
+bool RenderSystem::needsToneMapping() const{
+    return isHDRActive() || scene->getExposure() != 1.0f || scene->getToneMapping() != ToneMapping::NONE;
+}
+
+ColorFormat RenderSystem::getSceneColorFormat() const{
+    return isHDRActive() ? ColorFormat::RGBA16F : ColorFormat::RGBA;
+}
+
+void RenderSystem::loadToneMapping(){
+    if (toneMappingLoaded)
+        return;
+
+    // the shader may still be building (async in the editor)
+    toneMappingShader = ShaderPool::get(ShaderType::TONEMAP, 0);
+    if (!toneMappingShader || !toneMappingShader->isCreated())
+        return;
+
+    toneMappingRender.beginLoad(PrimitiveType::TRIANGLES);
+    toneMappingRender.setShader(toneMappingShader.get());
+    toneMappingSlotParams = toneMappingShader.get()->shaderData.getUniformBlockIndex(UniformBlockType::TONEMAP_FS_PARAMS);
+    if (!toneMappingRender.endLoad(PIP_RTT_NOBLEND, false, true, CullingMode::BACK, WindingOrder::CCW))
+        return;
+
+    toneMappingLoaded = true;
+}
+
+void RenderSystem::destroyToneMapping(){
+    if (toneMappingLoaded){
+        toneMappingRender.destroy();
+    }
+    if (toneMappingShader){
+        toneMappingShader.reset();
+        ShaderPool::remove(ShaderType::TONEMAP, 0);
+    }
+
+    toneMappingSlotParams = -1;
+    toneMappingLoaded = false;
+}
+
+void RenderSystem::renderToneMapping(TextureRender* source, FramebufferRender* destination){
+    fs_tone_mapping.params = Vector4(std::max(scene->getExposure(), 0.0f), (float)scene->getToneMapping(), 0.0f, 0.0f);
+
+    startFullscreenPass(postProcessPassRender, destination);
+    if (toneMappingRender.beginDraw(PIP_RTT_NOBLEND)){
+        ShaderData& sd = toneMappingShader.get()->shaderData;
+        toneMappingRender.addTexture(sd.getTextureIndex(TextureShaderType::SCENECOLORTEXTURE), ShaderStageType::FRAGMENT, source);
+        toneMappingRender.applyUniformBlock(toneMappingSlotParams, sizeof(fs_tone_mapping_t), &fs_tone_mapping);
+        toneMappingRender.draw(0, 3, 1);
+    }
+    postProcessPassRender.endRenderPass();
 }
 
 void RenderSystem::presentFramebufferToSwapchain(Framebuffer* source){
@@ -7074,7 +7553,7 @@ float RenderSystem::getPointsViewportHeight(const CameraComponent& camera) const
     }
     if (isFixedResolutionActive()){
         // the main color pass renders into the fixed-resolution target
-        return (float)scene->getFixedResolutionHeight();
+        return (float)fixedResHeight;
     }
     if (Framebuffer* engineFb = Engine::getFramebuffer()){
         if (engineFb->isCreated()){
@@ -7351,12 +7830,17 @@ bool RenderSystem::loadSky(Entity entity, SkyComponent& sky, uint16_t pipelines)
         }
     }
 
-    if (!render->endLoad(pipelines, true, true, CullingMode::BACK, WindingOrder::CCW)){
+    // a shader file's sky also draws into its capture
+    const uint16_t skyPipelines = isSkyCaptured(sky) ? (uint16_t)(pipelines | PIP_RTT_INVERT) : pipelines;
+    if (!render->endLoad(skyPipelines, true, true, CullingMode::BACK, WindingOrder::CCW)){
         return false;
     }
 
     sky.needReload = false;
     sky.loadCalled = true;
+    if (isSkyCaptured(sky)){
+        sky.needUpdateEnvironment = true;
+    }
     SystemRender::addQueueCommand(&changeLoaded, new check_load_t{scene, entity});
 
     return true;
@@ -7385,7 +7869,7 @@ bool RenderSystem::drawSky(SkyComponent& sky, PipelineType pipType){
             return false;
         }
         render.applyUniformBlock(sky.slotVSParams, sizeof(float) * 16, &sky.skyViewProjectionMatrix);
-        render.applyUniformBlock(sky.slotFSParams, sizeof(float) * 4, &sky.color);
+        render.applyUniformBlock(sky.slotFSParams, sizeof(fs_sky_t), &fs_sky);
         applyParameters(render, sky, scene, ShaderType::SKYBOX, Matrix4(), effectView, passResolution);
         render.draw(0, 36, 1);
     }
@@ -7409,6 +7893,7 @@ void RenderSystem::destroySky(Entity entity, SkyComponent& sky){
 
         //Release IBL environment maps (pooled maps are kept for reuse)
         releaseSkyEnvironment(sky);
+        destroySkyCapture();
         sky.needUpdateEnvironment = true;
     }
 
@@ -8161,7 +8646,12 @@ bool RenderSystem::drawWater(Entity entity, WaterComponent& water, Transform& tr
     auto skys = scene->getComponentArray<SkyComponent>();
     if (skys->size() > 0){
         SkyComponent& sky = skys->getComponentFromIndex(0);
-        if (sky.loaded){
+        if (isSkyCaptured(sky)){
+            // as the shader draws it
+            if (skyCaptureFramebuffer.isCreated()){
+                skyTexture = &skyCaptureFramebuffer.getColorTexture();
+            }
+        }else if (sky.loaded){
             TextureRender* texture = sky.texture.getRender(&emptyCubeWhite);
             if (texture && texture->isCreated()){
                 skyTexture = texture;
@@ -8171,8 +8661,7 @@ bool RenderSystem::drawWater(Entity entity, WaterComponent& water, Transform& tr
             irradiance = sky.irradianceMap.get();
             iblAmbient = true;
         }
-        Vector3 linColor = Color::sRGBToLinear(Vector3(sky.color.x, sky.color.y, sky.color.z));
-        envColor = Vector4(linColor.x, linColor.y, linColor.z, Angle::defaultToRad(sky.rotation));
+        envColor = getSkyEnvironment(sky);
     }else{
         // no sky, reflects the background color
         Vector4 background = scene->getBackgroundColor();
@@ -8718,7 +9207,8 @@ void RenderSystem::drawUnderwater(WaterComponent& water, CameraComponent& camera
         if (hasIBL && skys->size() > 0 && skys->getComponentFromIndex(0).irradianceMap){
             SkyComponent& sky = skys->getComponentFromIndex(0);
             irradiance = sky.irradianceMap.get();
-            skyColor = Color::sRGBToLinear(Vector3(sky.color.x, sky.color.y, sky.color.z));
+            const Vector4 environment = getSkyEnvironment(sky);
+            skyColor = Vector3(environment.x, environment.y, environment.z);
             light = Vector3(0.0f, 0.0f, 0.0f);
         }else{
             light = scene->getGlobalIlluminationColorLinear() * scene->getGlobalIlluminationIntensity();
@@ -8899,6 +9389,121 @@ void RenderSystem::updateTransform(Transform& transform, Entity entity){
 
     if (hasLights){
         transform.normalMatrix = transform.modelMatrix.inverse().transpose();
+    }
+}
+
+void RenderSystem::updateTransforms(){
+    auto transforms = scene->getComponentArray<Transform>();
+
+    for (int i = 0; i < transforms->size(); i++){
+        Transform& transform = transforms->getComponentFromIndex(i);
+
+        bool visibleInHierarchy = transform.visible;
+        if (transform.parent != NULL_ENTITY){
+            Transform* transformParent = scene->findComponent<Transform>(transform.parent);
+            if (transformParent){
+                if (transformParent->needUpdate){
+                    transform.needUpdate = true;
+                }
+
+                visibleInHierarchy = transform.visible && transformParent->visibleInHierarchy;
+            }
+        }
+        // a write only on change keeps the cache line clean
+        if (transform.visibleInHierarchy != visibleInHierarchy){
+            transform.visibleInHierarchy = visibleInHierarchy;
+        }
+
+        if (transform.needUpdate){
+            updateTransform(transform, transforms->getEntity(i));
+        }
+    }
+}
+
+// vertex offsets reach past the bounds by their longest offset
+static float meshOffsetReach(const MeshComponent& mesh){
+    if (mesh.vertexOffsetMax <= 0.0f)
+        return 0.0f;
+    // the loaded shader file, the scene default included
+    for (unsigned int s = 0; s < mesh.numSubmeshes; s++){
+        if (mesh.submeshes[s].customShaderId != 0)
+            return mesh.vertexOffsetMax;
+    }
+    return 0.0f;
+}
+
+void RenderSystem::updateMeshBounds(Entity entity, Signature signature, MeshComponent& mesh, const Transform& transform, bool instanced){
+    // Bones cancel out this mesh's model matrix, so the shader draws at
+    // modelMatrix * bonesMatrix[b] * vertex and modelMatrix * aabb mis-sizes the box
+    // once posed. Each bone bounds only its own share: the whole aabb per bone works
+    // too, but unions body-sized boxes over the skeleton. Local space so the editor
+    // draws the same box.
+    mesh.skinnedAABB.setNull();
+    // the palette only moves submeshes drawn with skinning
+    SkinComponent* skin = findComponent<SkinComponent>(scene, entity, signature);
+    bool skinned = false;
+    for (unsigned int s = 0; s < mesh.numSubmeshes; s++){
+        skinned = skinned || mesh.submeshes[s].hasSkinning;
+    }
+    if (!instanced && skin && skinned){
+        const size_t boneBounds = std::min(skin->bonesAABB.size(), skin->bonesMatrix.size());
+        for (size_t b = 0; b < boneBounds; b++){
+            if (!skin->bonesAABB[b].isNull()){
+                mesh.skinnedAABB.merge(skin->bonesMatrix[b] * skin->bonesAABB[b]);
+            }
+        }
+
+        if (mesh.skinnedAABB.isNull()){ // no per-bone bounds to pose
+            const Matrix4 identityMatrix;
+            for (size_t b = 0; b < skin->bonesMatrix.size(); b++){
+                const Matrix4& bone = skin->bonesMatrix[b];
+                if (bone != identityMatrix){
+                    mesh.skinnedAABB.merge(bone * mesh.aabb);
+                }
+            }
+        }
+    }
+    // a vertex offset moves geometry up to offsetReach past its bounds
+    auto worldBounds = [&](const AABB& box){
+        AABB world = transform.modelMatrix * box;
+        const float offset = meshOffsetReach(mesh);
+        if (offset > 0.0f && box.isFinite() && box != AABB::ZERO){
+            const Vector3 reach(offset, offset, offset);
+            world.setExtents(world.getMinimum() - reach, world.getMaximum() + reach);
+        }
+        return world;
+    };
+    mesh.worldAABB = worldBounds(mesh.skinnedAABB.isNull() ? mesh.aabb : mesh.skinnedAABB);
+
+    // Tilemap chunk bounds are refreshed with the mesh AABB: rebuilding a
+    // tilemap recalculates that AABB, and MeshSystem updates before this
+    // system, so new chunks are always current before draw().
+    if (signature.test(scene->getComponentId<TilemapComponent>())){
+        TilemapComponent& tilemap = scene->getComponent<TilemapComponent>(entity);
+        for (TilemapChunk& chunk : tilemap.chunks){
+            chunk.worldAABB = worldBounds(chunk.aabb);
+        }
+    }
+}
+
+void RenderSystem::updateWorldBounds(){
+    auto meshes = scene->getComponentArray<MeshComponent>();
+    for (int i = 0; i < meshes->size(); i++){
+        MeshComponent& mesh = meshes->getComponentFromIndex(i);
+        Entity entity = meshes->getEntity(i);
+        Signature signature = scene->getSignature(entity);
+        Transform* transform = findComponent<Transform>(scene, entity, signature);
+        // a settled sprite keeps its box with its copied vertices
+        if (!transform || isSpriteSettled(entity) || !(mesh.needUpdateAABB || transform->needUpdate))
+            continue;
+        // geometry still to be built or loaded, as a sprite sized by its texture: stays null
+        if (mesh.aabb == AABB::ZERO && !MeshSystem::hasGeometry(mesh))
+            continue;
+        // instances are boxed by the update, with the camera fade culling and billboards follow
+        if (signature.test(scene->getComponentId<InstancedMeshComponent>()))
+            continue;
+
+        updateMeshBounds(entity, signature, mesh, *transform, false);
     }
 }
 
@@ -9174,6 +9779,11 @@ void RenderSystem::updateMirrors(Entity mainCameraEntity){
 }
 
 void RenderSystem::updateSkyViewProjection(SkyComponent& sky, CameraComponent& camera){
+    sky.skyViewProjectionMatrix = getSkyViewProjection(camera, sky.rotation);
+    sky.needUpdateSky = false;
+}
+
+Matrix4 RenderSystem::getSkyViewProjection(const CameraComponent& camera, float rotation) const{
     Matrix4 skyViewMatrix = camera.viewMatrix;
 
     skyViewMatrix.set(3,0,0);
@@ -9184,16 +9794,16 @@ void RenderSystem::updateSkyViewProjection(SkyComponent& sky, CameraComponent& c
     skyViewMatrix.set(1,3,0);
     skyViewMatrix.set(0,3,0);
 
-    Matrix4 rotationMatrix = Quaternion(0, sky.rotation, 0).getRotationMatrix();
+    Matrix4 rotationMatrix = Quaternion(0, rotation, 0).getRotationMatrix();
 
-    sky.skyViewProjectionMatrix = camera.projectionMatrix * skyViewMatrix * rotationMatrix;
+    Matrix4 viewProjection = camera.projectionMatrix * skyViewMatrix * rotationMatrix;
 
     if (isRenderingFlipped(camera)){
         static const Matrix4 flipYMatrix = Matrix4::scaleMatrix(Vector3(1, -1, 1));
-        sky.skyViewProjectionMatrix = flipYMatrix * sky.skyViewProjectionMatrix;
+        viewProjection = flipYMatrix * viewProjection;
     }
 
-    sky.needUpdateSky = false;
+    return viewProjection;
 }
 
 void RenderSystem::updatePoints(PointsComponent& points, Transform& transform, CameraComponent& camera, Transform& camTransform){
@@ -10288,12 +10898,34 @@ bool RenderSystem::isRenderingFlipped(const CameraComponent& camera) const{
 }
 
 bool RenderSystem::isFixedResolutionActive() const{
-    // main scene only: layer scenes keep rendering at native resolution on top
-    return !disableFixedResolution
-        && scene->isFixedResolutionEnabled()
-        && scene->getFixedResolutionWidth() > 0
-        && scene->getFixedResolutionHeight() > 0
-        && Engine::getMainScene() == scene;
+    return fixedResolutionActive;
+}
+
+void RenderSystem::updateFixedResolution(){
+    // main scene only: layer scenes keep rendering at native resolution on top, a camera texture keeps its size
+    CameraComponent* camera = scene->findComponent<CameraComponent>(scene->getRenderCamera());
+    bool active = !disableFixedResolution && scene->isFixedResolutionEnabled() && Engine::getMainScene() == scene &&
+        camera && !camera->renderToTexture && Engine::isViewLoaded();
+    // the draw takes the target as it is now, so a later change waits for the next update
+    if (active){
+        loadBlit();
+        active = blitLoaded && ensureFixedResFramebuffer(scene->getFixedResolutionWidth(),
+            scene->getFixedResolutionHeight(), scene->getFixedResolutionFilter());
+    }
+    // the blit pipeline is kept, it is cheap and may be turned on again
+    if (!active && fixedResFramebuffer.isCreated()){
+        fixedResFramebuffer.destroy();
+        fixedResWidth = 0;
+        fixedResHeight = 0;
+    }
+
+    if (active != fixedResolutionActive){
+        fixedResolutionActive = active;
+        // the flip is baked in the MVP matrices
+        if (camera){
+            camera->needUpdate = true;
+        }
+    }
 }
 
 void RenderSystem::updateSwapchainRedirect(){
@@ -10301,9 +10933,11 @@ void RenderSystem::updateSwapchainRedirect(){
     // color buffer. Without a framebuffer destination (exported builds) the color pass is redirected
     // into it and the last pass targets the swapchain. Main scene only: a layer scene
     // composites over the scene below, and its own pass would clear it.
-    bool redirect = false;
+    Framebuffer* redirect = nullptr;
 
-    if (!Engine::getFramebuffer() && !isFixedResolutionActive()
+    // a camera drawing into a texture never reaches the swapchain
+    const CameraComponent* camera = scene->findComponent<CameraComponent>(scene->getRenderCamera());
+    if (!Engine::getFramebuffer() && !isFixedResolutionActive() && camera && !camera->renderToTexture
             && Engine::getMainScene() == scene && Engine::isViewLoaded()){
         unsigned int w = (unsigned int)Engine::getViewRect().getWidth();
         unsigned int h = (unsigned int)Engine::getViewRect().getHeight();
@@ -10312,13 +10946,17 @@ void RenderSystem::updateSwapchainRedirect(){
         // redirect only starts once everything it needs exists
         if (scene->isSSREnabled()){
             loadSSR();
-            redirect = ssrLoaded && ensureSSRFramebuffers(w, h) && ensureGBufferFramebuffer(w, h);
+            if (ssrLoaded && ensureSSRFramebuffers(w, h) && ensureGBufferFramebuffer(w, h)){
+                redirect = &sceneColorFramebuffer;
+            }
         }
-        if (!redirect && !scene->getPostProcessPasses().empty()){
+        if (!redirect && wantsPostProcess(*camera)){
             loadPostProcess();
-            loadBlit();
-            redirect = postProcessLoaded && blitLoaded && !postProcessPasses.empty()
-                    && ensurePostProcessFramebuffers(w, h);
+            bool bloom = false;
+            bool toneMapping = false;
+            if (preparePostProcess(w, h, bloom, toneMapping)){
+                redirect = &postProcessFramebuffer[0];
+            }
         }
 
         bool copiesScene = !sceneColorReaders.empty();
@@ -10327,17 +10965,24 @@ void RenderSystem::updateSwapchainRedirect(){
             const WaterComponent& water = waters->getComponentFromIndex(i);
             copiesScene = copiesScene || water.refraction || water.underwater;
         }
-        if (!redirect && copiesScene){
+        if (!redirect && copiesScene && ensureSceneColorFramebuffer(w, h)){
+            redirect = &sceneColorFramebuffer;
+        }
+
+        // the draw can always present it with a blit, also when its effect is off by then
+        if (redirect){
             loadBlit();
-            redirect = blitLoaded && ensureSceneColorFramebuffer(w, h);
+            if (!blitLoaded){
+                redirect = nullptr;
+            }
         }
     }
 
-    if (redirect != swapchainRedirect){
-        swapchainRedirect = redirect;
+    if ((redirect != nullptr) != (swapchainRedirect != nullptr)){
         // the flip is baked in the MVP matrices
         scene->getComponent<CameraComponent>(scene->getRenderCamera()).needUpdate = true;
     }
+    swapchainRedirect = redirect;
 }
 
 void RenderSystem::updateMVP(size_t index, Transform& transform, CameraComponent& camera, Transform& cameraTransform){
@@ -10478,6 +11123,9 @@ void RenderSystem::update(double dt){
         return;
     }
 
+    // once a frame, as the MVPs bake its flip
+    updateFixedResolution();
+
     spriteUpdates++;
 
     checkLightsAndShadow();
@@ -10489,32 +11137,10 @@ void RenderSystem::update(double dt){
         needReloadMeshes();
     }
 
+    updateTransforms();
+
     auto transforms = scene->getComponentArray<Transform>();
     auto cameras = scene->getComponentArray<CameraComponent>();
-
-    for (int i = 0; i < transforms->size(); i++){
-        Transform& transform = transforms->getComponentFromIndex(i);
-
-        bool visibleInHierarchy = transform.visible;
-        if (transform.parent != NULL_ENTITY){
-            Transform* transformParent = scene->findComponent<Transform>(transform.parent);
-            if (transformParent){
-                if (transformParent->needUpdate){
-                    transform.needUpdate = true;
-                }
-
-                visibleInHierarchy = transform.visible && transformParent->visibleInHierarchy;
-            }
-        }
-        // a write only on change keeps the cache line clean
-        if (transform.visibleInHierarchy != visibleInHierarchy){
-            transform.visibleInHierarchy = visibleInHierarchy;
-        }
-
-        if (transform.needUpdate){
-            updateTransform(transform, transforms->getEntity(i));
-        }
-    }
 
     auto models = scene->getComponentArray<ModelComponent>();
     for (int i = 0; i < models->size(); i++) {
@@ -10684,6 +11310,7 @@ void RenderSystem::update(double dt){
 
     auto skys = scene->getComponentArray<SkyComponent>();
     bool newHasIBL = false;
+    skyCaptureElapsed += (float)dt;
     if (skys->size() > 0){
         SkyComponent& sky = skys->getComponentFromIndex(0);
         Entity entity = skys->getEntity(0);
@@ -10713,7 +11340,8 @@ void RenderSystem::update(double dt){
             loadSky(entity, sky, pipelines);
         }
 
-        newHasIBL = sky.envMapsLoaded;
+        // a shader sky has its maps from its first capture, black until then
+        newHasIBL = sky.envMapsLoaded || isSkyCaptured(sky);
     }
 
     if (hasIBL != newHasIBL){
@@ -10736,7 +11364,15 @@ void RenderSystem::update(double dt){
         }
         updateWater(entity, water, *transform, pipelines, dt);
     }
-    newHasWaterDepth = newHasWaterDepth || !sceneDepthReaders.empty();
+    // the passes load first, so the meshes know whether to build depth shaders for them
+    if (wantsPostProcess(mainCamera)){
+        loadPostProcess();
+    }else{
+        // rebuilt by the update that wants it again, so a draw never runs a stale chain
+        postProcessLoaded = false;
+        postProcessNeedsDepth = false;
+    }
+    newHasWaterDepth = newHasWaterDepth || !sceneDepthReaders.empty() || postProcessNeedsDepth;
 
     if (hasWaterDepth != newHasWaterDepth){
         hasWaterDepth = newHasWaterDepth;
@@ -10791,17 +11427,7 @@ void RenderSystem::update(double dt){
 
             TerrainComponent* terrain = findComponent<TerrainComponent>(scene, entity, signature);
 
-            // vertex offsets reach past the bounds by their longest offset, read only when used
-            auto offsetReach = [&](){
-                if (mesh.vertexOffsetMax <= 0.0f)
-                    return 0.0f;
-                // the loaded shader file, the scene default included
-                for (unsigned int s = 0; s < mesh.numSubmeshes; s++){
-                    if (mesh.submeshes[s].customShaderId != 0)
-                        return mesh.vertexOffsetMax;
-                }
-                return 0.0f;
-            };
+            auto offsetReach = [&](){ return meshOffsetReach(mesh); };
 
             InstancedMeshComponent* instmesh = findComponent<InstancedMeshComponent>(scene, entity, signature);
             if (instmesh){
@@ -10975,59 +11601,8 @@ void RenderSystem::update(double dt){
                 loadMesh(entity, mesh, pipelines, instmesh, terrain);
             }
             if (mesh.needUpdateAABB || transform.needUpdate){
-                // Bones cancel out this mesh's model matrix, so the shader draws at
-                // modelMatrix * bonesMatrix[b] * vertex and modelMatrix * aabb mis-sizes the box
-                // once posed. Each bone bounds only its own share: the whole aabb per bone works
-                // too, but unions body-sized boxes over the skeleton. Local space so the editor
-                // draws the same box.
-                mesh.skinnedAABB.setNull();
-                // the palette only moves submeshes drawn with skinning
-                SkinComponent* skin = findComponent<SkinComponent>(scene, entity, signature);
-                bool skinned = false;
-                for (unsigned int s = 0; s < mesh.numSubmeshes; s++){
-                    skinned = skinned || mesh.submeshes[s].hasSkinning;
-                }
-                if (!instmesh && skin && skinned){
-                    const size_t boneBounds = std::min(skin->bonesAABB.size(), skin->bonesMatrix.size());
-                    for (size_t b = 0; b < boneBounds; b++){
-                        if (!skin->bonesAABB[b].isNull()){
-                            mesh.skinnedAABB.merge(skin->bonesMatrix[b] * skin->bonesAABB[b]);
-                        }
-                    }
-
-                    if (mesh.skinnedAABB.isNull()){ // no per-bone bounds to pose
-                        const Matrix4 identityMatrix;
-                        for (size_t b = 0; b < skin->bonesMatrix.size(); b++){
-                            const Matrix4& bone = skin->bonesMatrix[b];
-                            if (bone != identityMatrix){
-                                mesh.skinnedAABB.merge(bone * mesh.aabb);
-                            }
-                        }
-                    }
-                }
-                // a vertex offset moves geometry up to offsetReach past its bounds
-                auto worldBounds = [&](const AABB& box){
-                    AABB world = transform.modelMatrix * box;
-                    const float offset = offsetReach();
-                    if (offset > 0.0f && box.isFinite() && box != AABB::ZERO){
-                        const Vector3 reach(offset, offset, offset);
-                        world.setExtents(world.getMinimum() - reach, world.getMaximum() + reach);
-                    }
-                    return world;
-                };
-                mesh.worldAABB = worldBounds(mesh.skinnedAABB.isNull() ? mesh.aabb : mesh.skinnedAABB);
-
+                updateMeshBounds(entity, signature, mesh, transform, instmesh != nullptr);
                 mesh.needUpdateAABB = false;
-
-                // Tilemap chunk bounds are refreshed with the mesh AABB: rebuilding a
-                // tilemap recalculates that AABB, and MeshSystem updates before this
-                // system, so new chunks are always current before draw().
-                if (signature.test(scene->getComponentId<TilemapComponent>())){
-                    TilemapComponent& tilemap = scene->getComponent<TilemapComponent>(entity);
-                    for (TilemapChunk& chunk : tilemap.chunks){
-                        chunk.worldAABB = worldBounds(chunk.aabb);
-                    }
-                }
             }
 
             settleSprite(entity, signature, mesh, transform);
@@ -11263,14 +11838,6 @@ void RenderSystem::draw(){
     updateInstanceBuffers();
     updateSkinBuffers();
 
-    // free the fixed-resolution target when the setting is turned off (the blit
-    // pipeline itself is kept; it is cheap and may be re-enabled)
-    if (!isFixedResolutionActive() && fixedResFramebuffer.isCreated()){
-        fixedResFramebuffer.destroy();
-        fixedResWidth = 0;
-        fixedResHeight = 0;
-    }
-
     // shadow maps are fitted to the main camera, so effect functions see it there too
     if (CameraComponent* effectCamera = scene->findComponent<CameraComponent>(mainCameraEntity)){
         if (Transform* effectTransform = scene->findComponent<Transform>(mainCameraEntity)){
@@ -11494,6 +12061,14 @@ void RenderSystem::draw(){
         }
     }
 
+    // the sky every pass draws this frame, and its lighting when it changed
+    auto skys = scene->getComponentArray<SkyComponent>();
+    if (skys->size() > 0){
+        SkyComponent& sky = skys->getComponentFromIndex(0);
+        updateSkyParams(sky);
+        captureSky(sky);
+    }
+
     // Runtime-captured probes share a strict budget: one cubemap face total per
     // frame. Static probes without an authored cubemap capture once; dynamic
     // probes follow their configured update policy.
@@ -11558,28 +12133,24 @@ void RenderSystem::draw(){
         // Fixed game resolution (main scene main camera only): the color pass is
         // redirected into fixedResFramebuffer at the scene's fixed size, and
         // renderFixedResolutionBlit() upscales it to the view rect afterwards.
-        bool useFixedRes = false;
-        if (isMainCamera && !camera.renderToTexture && isFixedResolutionActive()){
-            loadBlit();
-            if (blitLoaded && ensureFixedResFramebuffer(scene->getFixedResolutionWidth(),
-                    scene->getFixedResolutionHeight(), scene->getFixedResolutionFilter())){
-                useFixedRes = true;
-            }
+        const bool useFixedRes = isMainCamera && !camera.renderToTexture && isFixedResolutionActive();
+
+        // the size the color pass draws at, which the screen-space passes take
+        unsigned int targetWidth = (unsigned int)Engine::getViewRect().getWidth();
+        unsigned int targetHeight = (unsigned int)Engine::getViewRect().getHeight();
+        if (useFixedRes){
+            targetWidth = fixedResWidth;
+            targetHeight = fixedResHeight;
+        }else if (camera.renderToTexture){
+            targetWidth = camera.framebuffer->getWidth();
+            targetHeight = camera.framebuffer->getHeight();
         }
 
         bool useSSR = false;
         FramebufferRender* ssrDestination = nullptr;
         if (isMainCamera && scene->isSSREnabled() && (Engine::getFramebuffer() || camera.renderToTexture || useFixedRes || swapchainRedirect)){
             loadSSR();
-            unsigned int sw = (unsigned int)Engine::getViewRect().getWidth();
-            unsigned int sh = (unsigned int)Engine::getViewRect().getHeight();
-            if (useFixedRes){
-                // effects run at the fixed resolution: SSR composites into the
-                // fixed-res target, which the blit then upscales
-                sw = fixedResWidth;
-                sh = fixedResHeight;
-            }
-            if (ssrLoaded && ensureSSRFramebuffers(sw, sh) && ensureGBufferFramebuffer(sw, sh)){
+            if (ssrLoaded && ensureSSRFramebuffers(targetWidth, targetHeight) && ensureGBufferFramebuffer(targetWidth, targetHeight)){
                 renderGBufferPass(camera);
                 useSSR = true;
             }
@@ -11589,34 +12160,22 @@ void RenderSystem::draw(){
         // follows the same destination-capture rule. Main scene only: its last pass
         // writes every pixel, so a layer scene would erase the scene below it.
         bool usePostProcess = false;
+        bool useBloom = false;
+        bool useToneMapping = false;
         FramebufferRender* postDestination = nullptr;
-        if (isMainCamera && !scene->getPostProcessPasses().empty()
-                && (Engine::getMainScene() == scene || camera.renderToTexture)
+        if (isMainCamera && !scene->isBloomEnabled() && bloomLevels > 0){
+            destroyBloomFramebuffers();
+        }
+        // the passes as update loaded them, before the meshes picked their depth shaders
+        if (isMainCamera && wantsPostProcess(camera)
                 && (Engine::getFramebuffer() || camera.renderToTexture || useFixedRes || swapchainRedirect)){
-            loadPostProcess();
-
             // only a swapchain destination ends the chain with a blit
             bool needsBlit = !(Engine::getFramebuffer() || camera.renderToTexture || useFixedRes);
             if (needsBlit){
                 loadBlit();
             }
-
-            unsigned int pw = useSSR ? ssrWidth : (unsigned int)Engine::getViewRect().getWidth();
-            unsigned int ph = useSSR ? ssrHeight : (unsigned int)Engine::getViewRect().getHeight();
-            if (useFixedRes){
-                pw = fixedResWidth;
-                ph = fixedResHeight;
-            }
-
-            if (postProcessLoaded && !postProcessPasses.empty() && (!needsBlit || blitLoaded)
-                    && ensurePostProcessFramebuffers(pw, ph)){
-                usePostProcess = true;
-
-                // a pass sampling depth needs the pre-pass when neither SSR nor SSAO ran
-                if (postProcessNeedsDepth && !useSSR && !scene->isSSAOEnabled()
-                        && ensureDepthPrePassFramebuffer(pw, ph)){
-                    renderDepthPrePass(camera);
-                }
+            if (!needsBlit || blitLoaded){
+                usePostProcess = preparePostProcess(targetWidth, targetHeight, useBloom, useToneMapping);
             }
         }
 
@@ -11630,24 +12189,13 @@ void RenderSystem::draw(){
             renderSSAO(camera, sharedDepth);
         }
 
-        // water depth from the SSR G-buffer, a pre-pass already drawn or its own pre-pass
+        // scene depth from the SSR G-buffer, a pre-pass already drawn or its own pre-pass
         if (isMainCamera && hasWaterDepth){
             if (useSSR){
                 currentSceneDepthTexture = &gbufferFramebuffer.getRender().getColorAttachmentTexture(0);
             }else{
-                if (!depthPrePassRendered){
-                    unsigned int dw = (unsigned int)Engine::getViewRect().getWidth();
-                    unsigned int dh = (unsigned int)Engine::getViewRect().getHeight();
-                    if (useFixedRes){
-                        dw = fixedResWidth;
-                        dh = fixedResHeight;
-                    }else if (camera.renderToTexture){
-                        dw = camera.framebuffer->getWidth();
-                        dh = camera.framebuffer->getHeight();
-                    }
-                    if (ensureDepthPrePassFramebuffer(dw, dh)){
-                        renderDepthPrePass(camera);
-                    }
+                if (!depthPrePassRendered && ensureDepthPrePassFramebuffer(targetWidth, targetHeight)){
+                    renderDepthPrePass(camera);
                 }
                 if (depthPrePassRendered){
                     currentSceneDepthTexture = &ssaoDepthFramebuffer.getRender().getColorTexture();
@@ -11679,9 +12227,9 @@ void RenderSystem::draw(){
         WaterComponent* underwater = (isMainCamera && !disableUnderwater) ? findUnderwater(cameraTransform.worldPosition) : NULL;
         currentUnderwater = (underwater && loadUnderwater(*underwater)) ? underwater : NULL;
 
-        // the swapchain redirect of a water copying the scene, when no other effect took it
+        // the buffer update redirected the frame into, also when its effect was turned off since
         const bool useSceneTarget = isMainCamera && swapchainRedirect && !useSSR && !usePostProcess
-                && !camera.renderToTexture && sceneColorFramebuffer.isCreated();
+                && !camera.renderToTexture && swapchainRedirect->isCreated();
 
         // whether this camera's color pass targets an offscreen framebuffer
         // (selects PIP_RTT pipelines and flipped rendering on GL)
@@ -11775,9 +12323,9 @@ void RenderSystem::draw(){
                 camera.render.startRenderPass(&Engine::getFramebuffer()->getRender());
             }else if (useSceneTarget){
                 // presented by a blit once the pass is done
-                colorPassViewport = Rect(0, 0, (float)sceneColorFramebuffer.getWidth(), (float)sceneColorFramebuffer.getHeight());
-                colorTarget = &sceneColorFramebuffer;
-                camera.render.startRenderPass(&sceneColorFramebuffer.getRender());
+                colorPassViewport = Rect(0, 0, (float)swapchainRedirect->getWidth(), (float)swapchainRedirect->getHeight());
+                colorTarget = swapchainRedirect;
+                camera.render.startRenderPass(&swapchainRedirect->getRender());
             }else{
                 camera.render.startRenderPass();
             }
@@ -12201,12 +12749,12 @@ void RenderSystem::draw(){
 
         if (useSceneTarget){
             const Rect viewport = Engine::getViewRect();
-            renderBlit(&sceneColorFramebuffer.getRender().getColorTexture(), nullptr, &viewport);
+            renderBlit(&swapchainRedirect->getRender().getColorTexture(), nullptr, &viewport);
         }
 
         // buffer 0 now holds the scene color (or the SSR composite)
         if (usePostProcess){
-            renderPostProcess(postDestination);
+            renderPostProcess(postDestination, useBloom, useToneMapping);
         }
 
         // Fixed game resolution: upscale the offscreen scene color to the view

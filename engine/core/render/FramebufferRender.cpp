@@ -19,9 +19,9 @@ FramebufferRender::~FramebufferRender(){
     //Cannot destroy because its a handle
 }
 
-bool FramebufferRender::createFramebuffer(TextureType textureType, int width, int height, TextureFilter minFilter, TextureFilter magFilter, TextureWrap wrapU, TextureWrap wrapV, bool shadowMap){
+bool FramebufferRender::createFramebuffer(TextureType textureType, int width, int height, TextureFilter minFilter, TextureFilter magFilter, TextureWrap wrapU, TextureWrap wrapV, bool shadowMap, ColorFormat format){
     if (Engine::isViewLoaded() && !isCreated())
-        return backend.createFramebuffer(textureType, width, height, minFilter, magFilter, wrapU, wrapV, shadowMap);
+        return backend.createFramebuffer(textureType, width, height, minFilter, magFilter, wrapU, wrapV, shadowMap, format);
     else
         return false;
 }
@@ -58,6 +58,14 @@ TextureRender& FramebufferRender::getColorAttachmentTexture(int index){
 
 int FramebufferRender::getNumColorAttachments() const{
     return backend.getNumColorAttachments();
+}
+
+ColorFormat FramebufferRender::getColorFormat() const{
+    return backend.getColorFormat();
+}
+
+bool FramebufferRender::isColorFormatSupported(ColorFormat format){
+    return SokolFramebuffer::isColorFormatSupported(format);
 }
 
 TextureRender& FramebufferRender::getDepthTexture(){

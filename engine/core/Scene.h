@@ -21,7 +21,7 @@ namespace doriax{
 
     class Camera;
 
-    // LightState and ShadowQuality live in SceneSettings.h (they are scene-setting types).
+    // LightState, ShadowQuality and ToneMapping live in SceneSettings.h (they are scene-setting types).
 
     enum class UIEventState {
         NOT_SET,
@@ -93,6 +93,9 @@ namespace doriax{
         virtual ~Scene();
 
         void load();
+        // world transforms and bounds a script reads in init(), before the first update;
+        // the generated stack start calls it for its new scenes, editor Play starts from updated ones
+        void prepareScripts();
         void destroy();
         void draw();
         void update(double dt);
@@ -199,6 +202,30 @@ namespace doriax{
 
         void setSSRDebugMode(int mode);
         int getSSRDebugMode() const;
+
+        void setBloomEnabled(bool bloomEnabled);
+        bool isBloomEnabled() const;
+
+        void setBloomThreshold(float threshold);
+        float getBloomThreshold() const;
+
+        void setBloomKnee(float knee);
+        float getBloomKnee() const;
+
+        void setBloomIntensity(float intensity);
+        float getBloomIntensity() const;
+
+        void setBloomRadius(float radius);
+        float getBloomRadius() const;
+
+        void setHDREnabled(bool hdrEnabled);
+        bool isHDREnabled() const;
+
+        void setExposure(float exposure);
+        float getExposure() const;
+
+        void setToneMapping(ToneMapping toneMapping);
+        ToneMapping getToneMapping() const;
 
         void setFixedResolutionEnabled(bool fixedResolutionEnabled);
         bool isFixedResolutionEnabled() const;
